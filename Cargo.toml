@@ -1,0 +1,21 @@
+[package]
+name = "ororesea"
+version = "0.1.0"
+edition = "2024"
+description = "Read-only Windows Display Affinity static analyzer"
+
+[dependencies]
+csv = "1.4.0"
+eframe = { version = "0.36.1", default-features = false, features = ["default_fonts", "glow"] }
+goblin = "0.10.7"
+rfd = "0.17.2"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+sha2 = "0.10.9"
+walkdir = "2.5.0"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+
