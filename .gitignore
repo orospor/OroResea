@@ -1,4 +1,5 @@
 /target/
+/outputs/
 /*.png
 *.pdb
 *.log

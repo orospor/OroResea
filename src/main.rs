@@ -1,9 +1,12 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;
+mod live_posture;
 mod model;
+mod posture;
 mod report;
 mod scanner;
+mod static_posture;
 
 use app::OroReseaApp;
 use eframe::egui;

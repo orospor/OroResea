@@ -1,8 +1,8 @@
 [package]
 name = "ororesea"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
-description = "Read-only Windows Display Affinity static analyzer"
+description = "Read-only Windows WDA evidence and process protection posture analyzer"
 
 [dependencies]
 csv = "1.4.0"
@@ -14,8 +14,18 @@ serde_json = "1.0.149"
 sha2 = "0.10.9"
 walkdir = "2.5.0"
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_System_Diagnostics_Debug",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_Memory",
+    "Win32_System_SystemServices",
+    "Win32_System_Threading",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
 [profile.release]
 lto = "thin"
 codegen-units = 1
 strip = "symbols"
-
