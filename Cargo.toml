@@ -1,8 +1,8 @@
 [package]
 name = "ororesea"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
-description = "Read-only Windows WDA evidence and process protection posture analyzer"
+description = "Read-only Windows capture-protection capability and process-posture analyzer"
 
 [dependencies]
 csv = "1.4.0"

@@ -96,7 +96,7 @@ pub fn write_html(path: &Path, source: &str, results: &[ScanResult]) -> Result<(
     .map_err(io_error)?;
     write!(
         file,
-        "<header><div class=\"brand\">OR</div><div><h1>OroResea analysis report</h1><p>Read-only static WDA evidence scan</p></div></header><main><section class=\"source\"><b>Source</b><code>{}</code></section>",
+        "<header><div class=\"brand\">OR</div><div><h1>OroResea analysis report</h1><p>Read-only static Windows protection-capability scan</p></div></header><main><section class=\"source\"><b>Source</b><code>{}</code></section>",
         escape_html(source)
     )
     .map_err(io_error)?;
@@ -163,7 +163,7 @@ fn posture_report(assessment: &PostureAssessment) -> PostureReport<'_> {
     PostureReport {
         application: "OroResea",
         version: env!("CARGO_PKG_VERSION"),
-        schema_version: 1,
+        schema_version: 2,
         generated_unix_seconds: SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -281,7 +281,12 @@ pub fn write_posture_html(path: &Path, assessment: &PostureAssessment) -> Result
     )
     .map_err(io_error)?;
 
-    for scope in [AuditScope::Static, AuditScope::Live, AuditScope::System] {
+    for scope in [
+        AuditScope::Profile,
+        AuditScope::Static,
+        AuditScope::Live,
+        AuditScope::System,
+    ] {
         write!(
             file,
             "<section class=\"results\"><h2>{} CHECKS</h2>",
@@ -345,7 +350,9 @@ const CSS: &str = r#"
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{PostureCheck, PostureTarget, PostureVerdict, ProtectionKind, RiskLevel};
+    use crate::model::{
+        AssessmentProfile, PostureCheck, PostureTarget, PostureVerdict, ProtectionKind, RiskLevel,
+    };
     use std::{fs, path::PathBuf};
 
     fn sample_result() -> ScanResult {
@@ -366,6 +373,7 @@ mod tests {
 
     fn sample_posture() -> PostureAssessment {
         PostureAssessment {
+            profile: AssessmentProfile::Generic,
             target: PostureTarget {
                 path: Some(PathBuf::from(r"C:\sample\probe&tool.exe")),
                 pid: Some(4242),
@@ -445,7 +453,7 @@ mod tests {
         )
         .expect("posture JSON report should parse");
         assert_eq!(json["application"], "OroResea");
-        assert_eq!(json["schema_version"], 1);
+        assert_eq!(json["schema_version"], 2);
         assert_eq!(json["summary"]["pass"], 1);
         assert_eq!(json["summary"]["warning"], 1);
         assert_eq!(json["summary"]["unavailable"], 1);

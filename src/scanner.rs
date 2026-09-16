@@ -17,6 +17,23 @@ use walkdir::WalkDir;
 const MAX_FILE_SIZE: u64 = 512 * 1024 * 1024;
 const TARGET_EXTENSIONS: &[&str] = &["exe", "dll", "node", "ocx", "cpl", "scr", "sys"];
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScanOptions {
+    pub wda: bool,
+    pub process_mitigations: bool,
+    pub dll_loading: bool,
+}
+
+impl Default for ScanOptions {
+    fn default() -> Self {
+        Self {
+            wda: true,
+            process_mitigations: true,
+            dll_loading: true,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct ParsedImport {
     dll: String,
@@ -41,16 +58,19 @@ pub enum ScanMessage {
     },
 }
 
-pub fn spawn_scan(root: PathBuf) -> (Receiver<ScanMessage>, Arc<AtomicBool>) {
+pub fn spawn_scan_with_options(
+    root: PathBuf,
+    options: ScanOptions,
+) -> (Receiver<ScanMessage>, Arc<AtomicBool>) {
     let (tx, rx) = mpsc::channel();
     let cancel = Arc::new(AtomicBool::new(false));
     let worker_cancel = Arc::clone(&cancel);
 
-    thread::spawn(move || run_scan(root, tx, worker_cancel));
+    thread::spawn(move || run_scan(root, tx, worker_cancel, options));
     (rx, cancel)
 }
 
-fn run_scan(root: PathBuf, tx: Sender<ScanMessage>, cancel: Arc<AtomicBool>) {
+fn run_scan(root: PathBuf, tx: Sender<ScanMessage>, cancel: Arc<AtomicBool>, options: ScanOptions) {
     let started = Instant::now();
     let candidates = collect_candidates(&root);
     let total = candidates.len();
@@ -79,7 +99,7 @@ fn run_scan(root: PathBuf, tx: Sender<ScanMessage>, cancel: Arc<AtomicBool>) {
             return;
         }
 
-        let result = analyze_file(&path);
+        let result = analyze_file_with_options(&path, options);
         if tx.send(ScanMessage::Result(result)).is_err() {
             return;
         }
@@ -116,7 +136,12 @@ fn is_candidate(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
+#[cfg(test)]
 pub fn analyze_file(path: &Path) -> ScanResult {
+    analyze_file_with_options(path, ScanOptions::default())
+}
+
+pub fn analyze_file_with_options(path: &Path, options: ScanOptions) -> ScanResult {
     let metadata = match fs::metadata(path) {
         Ok(metadata) => metadata,
         Err(error) => return ScanResult::failed(path.to_owned(), error.to_string()),
@@ -178,7 +203,7 @@ pub fn analyze_file(path: &Path) -> ScanResult {
     imports.extend(parse_delay_imports(&bytes, &pe));
     let is_managed = contains_ascii_ci(&bytes, b"mscoree.dll")
         || contains_ascii_ci(&bytes, b"System.Runtime.InteropServices");
-    let findings = classify_evidence(&imports, &bytes, is_managed);
+    let findings = classify_evidence_with_options(&imports, &bytes, is_managed, options);
     let highest_level = findings
         .iter()
         .map(|finding| finding.level)
@@ -187,12 +212,7 @@ pub fn analyze_file(path: &Path) -> ScanResult {
 
     let relevant_imports = imports
         .iter()
-        .filter(|import| {
-            import.name.eq_ignore_ascii_case("SetWindowDisplayAffinity")
-                || import.name.eq_ignore_ascii_case("GetWindowDisplayAffinity")
-                || import.name.eq_ignore_ascii_case("GetProcAddress")
-                || import.name.to_ascii_lowercase().starts_with("loadlibrary")
-        })
+        .filter(|import| is_relevant_import(&import.name, options))
         .map(|import| {
             format!(
                 "{}!{}{}",
@@ -224,7 +244,39 @@ pub fn analyze_file(path: &Path) -> ScanResult {
     }
 }
 
+#[cfg(test)]
 fn classify_evidence(imports: &[ParsedImport], bytes: &[u8], is_managed: bool) -> Vec<Evidence> {
+    classify_evidence_with_options(imports, bytes, is_managed, ScanOptions::default())
+}
+
+fn classify_evidence_with_options(
+    imports: &[ParsedImport],
+    bytes: &[u8],
+    is_managed: bool,
+    options: ScanOptions,
+) -> Vec<Evidence> {
+    let mut findings = Vec::new();
+
+    if options.wda {
+        classify_wda_evidence(imports, bytes, is_managed, &mut findings);
+    }
+    if options.process_mitigations {
+        classify_mitigation_capabilities(imports, bytes, &mut findings);
+    }
+    if options.dll_loading {
+        classify_dll_capabilities(imports, bytes, &mut findings);
+    }
+
+    findings.sort_by_key(|finding| std::cmp::Reverse(finding.level.rank()));
+    findings
+}
+
+fn classify_wda_evidence(
+    imports: &[ParsedImport],
+    bytes: &[u8],
+    is_managed: bool,
+    findings: &mut Vec<Evidence>,
+) {
     let set_import = imports
         .iter()
         .find(|import| import.name.eq_ignore_ascii_case("SetWindowDisplayAffinity"));
@@ -241,8 +293,6 @@ fn classify_evidence(imports: &[ParsedImport], bytes: &[u8], is_managed: bool) -
         || contains_text_ci(bytes, "LdrGetProcedureAddress");
     let exclusion_marker = contains_text_ci(bytes, "WDA_EXCLUDEFROMCAPTURE");
     let monitor_marker = contains_text_ci(bytes, "WDA_MONITOR");
-
-    let mut findings = Vec::new();
 
     if let Some(import) = set_import {
         findings.push(Evidence {
@@ -303,9 +353,141 @@ fn classify_evidence(imports: &[ParsedImport], bytes: &[u8], is_managed: bool) -
             detail: "GetWindowDisplayAffinity reads protection state; by itself it does not apply capture blocking.".to_owned(),
         });
     }
+}
 
-    findings.sort_by_key(|finding| std::cmp::Reverse(finding.level.rank()));
-    findings
+fn classify_mitigation_capabilities(
+    imports: &[ParsedImport],
+    bytes: &[u8],
+    findings: &mut Vec<Evidence>,
+) {
+    push_api_capability(
+        findings,
+        imports,
+        bytes,
+        "SetProcessMitigationPolicy",
+        EvidenceKind::MitigationApi,
+        "Process-mitigation setter capability",
+        "The image can request a process mitigation such as a binary-signature/CIG or dynamic-code policy. The import does not identify the selected policy, flags, timing, or whether Windows accepted it.",
+    );
+    push_api_capability(
+        findings,
+        imports,
+        bytes,
+        "GetProcessMitigationPolicy",
+        EvidenceKind::MitigationApi,
+        "Process-mitigation inspection capability",
+        "The image can read an effective process-mitigation policy. Inspection capability alone does not enable CIG or another mitigation.",
+    );
+
+    let setter_present = imports.iter().any(|import| {
+        import
+            .name
+            .eq_ignore_ascii_case("SetProcessMitigationPolicy")
+    }) || contains_text_ci(bytes, "SetProcessMitigationPolicy");
+    let signature_marker = contains_text_ci(bytes, "ProcessSignaturePolicy")
+        || contains_text_ci(bytes, "MicrosoftSignedOnly")
+        || contains_text_ci(bytes, "microsoft_signed_only");
+    if setter_present && signature_marker {
+        findings.push(Evidence {
+            kind: EvidenceKind::MitigationApi,
+            level: RiskLevel::Informational,
+            confidence: 70,
+            title: "Probable binary-signature/CIG policy capability".to_owned(),
+            detail: "A process-mitigation setter and a signature-policy marker occur in the same image. This supports CIG capability only; active enforcement requires GetProcessMitigationPolicy readback from a running process.".to_owned(),
+        });
+    }
+}
+
+fn classify_dll_capabilities(imports: &[ParsedImport], bytes: &[u8], findings: &mut Vec<Evidence>) {
+    for (api, title, detail) in [
+        (
+            "SetDefaultDllDirectories",
+            "Default DLL-directory hardening capability",
+            "The image can restrict default DLL search locations. Static presence does not prove the function ran successfully or reveal the requested flags.",
+        ),
+        (
+            "SetDllDirectoryW",
+            "DLL search-directory control capability",
+            "The image can change process-local DLL search behavior. Static presence does not reveal the supplied directory or effective runtime state.",
+        ),
+        (
+            "AddDllDirectory",
+            "Explicit DLL-directory capability",
+            "The image can add a process DLL search directory. This may support controlled loading or broaden search depending on the runtime path and flags.",
+        ),
+    ] {
+        push_api_capability(
+            findings,
+            imports,
+            bytes,
+            api,
+            EvidenceKind::DllSearchHardening,
+            title,
+            detail,
+        );
+    }
+
+    for api in ["LoadLibraryExW", "LoadLibraryW", "LoadLibraryA"] {
+        push_api_capability(
+            findings,
+            imports,
+            bytes,
+            api,
+            EvidenceKind::LoaderCapability,
+            "Explicit Windows image-loader capability",
+            "The image can request a DLL load. This is common Windows functionality and does not by itself indicate injection, malicious behavior, or a successful load.",
+        );
+    }
+}
+
+fn push_api_capability(
+    findings: &mut Vec<Evidence>,
+    imports: &[ParsedImport],
+    bytes: &[u8],
+    api: &str,
+    kind: EvidenceKind,
+    title: &str,
+    detail: &str,
+) {
+    if let Some(import) = imports
+        .iter()
+        .find(|import| import.name.eq_ignore_ascii_case(api))
+    {
+        findings.push(Evidence {
+            kind,
+            level: RiskLevel::Informational,
+            confidence: if import.delayed { 92 } else { 95 },
+            title: if import.delayed {
+                format!("Delay-loaded {title}")
+            } else {
+                title.to_owned()
+            },
+            detail: format!("{detail} Imported API: {api}."),
+        });
+    } else if contains_text_ci(bytes, api) {
+        findings.push(Evidence {
+            kind,
+            level: RiskLevel::Informational,
+            confidence: 45,
+            title: format!("{title} string found"),
+            detail: format!("The API name {api} occurs as ASCII or UTF-16 text, but a matching PE import was not confirmed. {detail}"),
+        });
+    }
+}
+
+fn is_relevant_import(name: &str, options: ScanOptions) -> bool {
+    (options.wda
+        && (name.eq_ignore_ascii_case("SetWindowDisplayAffinity")
+            || name.eq_ignore_ascii_case("GetWindowDisplayAffinity")
+            || name.eq_ignore_ascii_case("GetProcAddress")))
+        || (options.process_mitigations
+            && (name.eq_ignore_ascii_case("SetProcessMitigationPolicy")
+                || name.eq_ignore_ascii_case("GetProcessMitigationPolicy")))
+        || (options.dll_loading
+            && (name.eq_ignore_ascii_case("SetDefaultDllDirectories")
+                || name.eq_ignore_ascii_case("SetDllDirectoryW")
+                || name.eq_ignore_ascii_case("AddDllDirectory")
+                || name.to_ascii_lowercase().starts_with("loadlibrary")))
 }
 
 fn parse_delay_imports(bytes: &[u8], pe: &goblin::pe::PE<'_>) -> Vec<ParsedImport> {
@@ -584,6 +766,65 @@ mod tests {
             .flat_map(u16::to_le_bytes)
             .collect();
         assert!(contains_text_ci(&bytes, "setwindowdisplayaffinity"));
+    }
+
+    #[test]
+    fn mitigation_import_is_capability_not_active_cig() {
+        let imports = vec![ParsedImport {
+            dll: "KERNEL32.dll".to_owned(),
+            name: "SetProcessMitigationPolicy".to_owned(),
+            delayed: false,
+        }];
+        let findings = classify_evidence_with_options(
+            &imports,
+            b"ProcessSignaturePolicy\0",
+            false,
+            ScanOptions {
+                wda: false,
+                process_mitigations: true,
+                dll_loading: false,
+            },
+        );
+        assert!(findings.iter().any(|finding| {
+            finding.kind == EvidenceKind::MitigationApi
+                && finding.title == "Process-mitigation setter capability"
+                && finding.level == RiskLevel::Informational
+        }));
+        assert!(findings.iter().any(|finding| {
+            finding.title == "Probable binary-signature/CIG policy capability"
+                && finding
+                    .detail
+                    .contains("requires GetProcessMitigationPolicy readback")
+        }));
+    }
+
+    #[test]
+    fn scan_options_keep_capability_families_independent() {
+        let imports = vec![
+            ParsedImport {
+                dll: "USER32.dll".to_owned(),
+                name: "SetWindowDisplayAffinity".to_owned(),
+                delayed: false,
+            },
+            ParsedImport {
+                dll: "KERNEL32.dll".to_owned(),
+                name: "SetDefaultDllDirectories".to_owned(),
+                delayed: false,
+            },
+        ];
+        let findings = classify_evidence_with_options(
+            &imports,
+            b"",
+            false,
+            ScanOptions {
+                wda: false,
+                process_mitigations: false,
+                dll_loading: true,
+            },
+        );
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].kind, EvidenceKind::DllSearchHardening);
+        assert_eq!(findings[0].level, RiskLevel::Informational);
     }
 
     #[test]

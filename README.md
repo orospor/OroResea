@@ -1,4 +1,4 @@
-# OroResea 0.2.0
+# OroResea 0.3.0
 
 OroResea is a local, read-only Windows desktop analyzer for capture-protection
 evidence and process protection posture. It separates what a PE file declares
@@ -7,19 +7,22 @@ presented as proof that an application is impossible to capture or inject.
 
 ## Analysis modes
 
-### WDA Evidence
+### Static capability scan
 
 Point OroResea at one Windows executable or DLL, or scan a directory tree. The
-scanner looks for Windows Display Affinity (WDA) capability without launching
-or modifying the inspected files:
+scanner has three independently selectable categories and never launches or
+modifies the inspected files:
 
-- Direct and delay-loaded PE imports of `SetWindowDisplayAffinity`
-- Probable runtime resolution through embedded API names plus
-  `GetProcAddress` or `LdrGetProcedureAddress` evidence
-- ASCII and UTF-16 API-name strings
-- Named `WDA_EXCLUDEFROMCAPTURE` and `WDA_MONITOR` markers
-- `GetWindowDisplayAffinity` as informational inspection capability
-- PE architecture, SHA-256, and embedded certificate-table presence
+- **WDA APIs and markers:** direct and delay-loaded imports, probable dynamic
+  bindings, API strings, named WDA modes, and display-affinity inspection.
+- **CIG / mitigation APIs:** `SetProcessMitigationPolicy`,
+  `GetProcessMitigationPolicy`, and supporting signature-policy markers.
+- **DLL search / loading APIs:** `SetDefaultDllDirectories`,
+  `SetDllDirectoryW`, `AddDllDirectory`, and `LoadLibrary` variants.
+
+Every result also records PE architecture, SHA-256, and embedded
+certificate-table presence. CIG and DLL findings are reported as capabilities;
+static API presence does not prove a policy was requested or accepted.
 
 Static evidence is not proof of runtime behavior. An application can import
 `SetWindowDisplayAffinity` only to clear protection with `WDA_NONE`, while
@@ -57,6 +60,34 @@ WDA results are observations unless a separate policy baseline defines what a
 particular application must enforce. `WDA_NONE` is therefore informational,
 all visible windows protected is positive evidence, and mixed or incomplete
 visible-window results are warnings.
+
+### OroNimbus lab profile
+
+Protection Posture now includes a dedicated **OroNimbus lab** profile. Choose
+the expected WDA mode (`NONE`, `MONITOR`, or `EXCLUDE`) and expected main-PID
+CIG state (`off` or `MicrosoftSignedOnly`), select the running PID that owns the
+visible OroNimbus window, and take a snapshot.
+
+The profile adds an independently collected correlation section for:
+
+- Process name/path identity evidence and likely main/WDA-owner scope.
+- Exact per-window WDA comparison; MONITOR and EXCLUDE are not merged.
+- Exact `MicrosoftSignedOnly` bit matching rather than treating every nonzero
+  signature policy as OroNimbus CIG.
+- Loader-visible presence of the packaged `wda_native.node` bridge.
+- An explicit `unverified externally` result for OroNimbus DLL-search
+  hardening. Windows `ProcessImageLoadPolicy` is a different control and is not
+  used as a substitute readback.
+
+**Find OroNimbus** refreshes the process inventory and applies a convenience
+text filter. The operator still selects the intended PID; a process name alone
+is not treated as product identity. Chromium children are not assumed to
+inherit the main process's WDA or post-bootstrap CIG.
+
+The OroNimbus profile does not rerun the browser's transient unsigned CIG
+probe, recover watchdog history, or infer exact renderer/GPU roles. Those are
+internal OroNimbus evidence surfaces and remain distinct from OroResea's
+external Windows snapshot.
 
 ## Access and administrator mode
 
@@ -98,13 +129,15 @@ The x64 executable is written to
 
 ## Use
 
-1. Start OroResea and choose **WDA Evidence** or **Protection Posture**.
+1. Start OroResea and choose **Static Capabilities** or **Protection Posture**.
 2. For a pre-launch assessment, choose an executable or DLL and analyze the
    file. OroResea does not start it.
 3. For a live assessment, refresh the process list, select the intended PID,
    and take a snapshot. Repeat after a state change when current evidence is
    important.
-4. Review unavailable evidence and the limitations before drawing a conclusion,
+4. For OroNimbus, select **OroNimbus lab**, choose the expected WDA/CIG launch
+   configuration, select the visible-window owner PID, and snapshot it.
+5. Review unavailable evidence and the limitations before drawing a conclusion,
    then export JSON, CSV, or HTML when a report is needed.
 
 ## Safety boundary

@@ -1,12 +1,13 @@
 use crate::{
     live_posture::ProcessSummary,
     model::{
-        AuditScope, PostureAssessment, PostureCheck, PostureVerdict, ReportSummary, RiskLevel,
-        ScanResult,
+        AssessmentProfile, AuditScope, OroNimbusCigExpectation, OroNimbusProfile,
+        OroNimbusWdaExpectation, PostureAssessment, PostureCheck, PostureVerdict, ReportSummary,
+        RiskLevel, ScanResult,
     },
     posture::{self, PostureMessage},
     report,
-    scanner::{self, ScanMessage},
+    scanner::{self, ScanMessage, ScanOptions},
 };
 use eframe::egui::{
     self, Align, Color32, FontId, Layout, ProgressBar, RichText, ScrollArea, Sense, Stroke,
@@ -44,6 +45,9 @@ pub struct OroReseaApp {
     selected: Option<usize>,
     query: String,
     only_flagged: bool,
+    scan_wda: bool,
+    scan_process_mitigations: bool,
+    scan_dll_loading: bool,
     scan_rx: Option<Receiver<ScanMessage>>,
     cancel: Option<Arc<AtomicBool>>,
     scanning: bool,
@@ -57,6 +61,7 @@ pub struct OroReseaApp {
     posture_selected_pid: Option<u32>,
     posture_query: String,
     posture_visible_only: bool,
+    posture_profile: AssessmentProfile,
     posture_rx: Option<Receiver<PostureMessage>>,
     posture_assessment: Option<PostureAssessment>,
     posture_busy: bool,
@@ -74,6 +79,9 @@ impl OroReseaApp {
             selected: None,
             query: String::new(),
             only_flagged: false,
+            scan_wda: true,
+            scan_process_mitigations: true,
+            scan_dll_loading: true,
             scan_rx: None,
             cancel: None,
             scanning: false,
@@ -87,6 +95,7 @@ impl OroReseaApp {
             posture_selected_pid: None,
             posture_query: String::new(),
             posture_visible_only: false,
+            posture_profile: AssessmentProfile::Generic,
             posture_rx: None,
             posture_assessment: None,
             posture_busy: false,
@@ -108,7 +117,19 @@ impl OroReseaApp {
             return;
         }
 
-        let (rx, cancel) = scanner::spawn_scan(source);
+        if !self.scan_wda && !self.scan_process_mitigations && !self.scan_dll_loading {
+            self.status = "Select at least one static scan category.".to_owned();
+            return;
+        }
+
+        let (rx, cancel) = scanner::spawn_scan_with_options(
+            source,
+            ScanOptions {
+                wda: self.scan_wda,
+                process_mitigations: self.scan_process_mitigations,
+                dll_loading: self.scan_dll_loading,
+            },
+        );
         self.results.clear();
         self.selected = None;
         self.scan_rx = Some(rx);
@@ -232,7 +253,10 @@ impl OroReseaApp {
             return;
         }
 
-        self.posture_rx = Some(posture::spawn_file_assessment(source.clone()));
+        self.posture_rx = Some(posture::spawn_file_assessment_with_profile(
+            source.clone(),
+            self.posture_profile,
+        ));
         self.posture_busy = true;
         self.posture_status = format!(
             "Reading static mitigations and Authenticode trust for {}...",
@@ -254,7 +278,10 @@ impl OroReseaApp {
             .find(|process| process.pid == pid)
             .map(|process| process.executable_name.as_str())
             .unwrap_or("selected process");
-        self.posture_rx = Some(posture::spawn_process_assessment(pid));
+        self.posture_rx = Some(posture::spawn_process_assessment_with_profile(
+            pid,
+            self.posture_profile,
+        ));
         self.posture_busy = true;
         self.posture_status = format!("Capturing read-only posture for {name} (PID {pid})...");
     }
@@ -306,7 +333,7 @@ impl OroReseaApp {
                     return;
                 }
                 if let Some(path) = FileDialog::new()
-                    .set_file_name("OroResea-WDA-report.json")
+                    .set_file_name("OroResea-static-capability-report.json")
                     .add_filter("JSON report", &["json"])
                     .save_file()
                 {
@@ -344,7 +371,7 @@ impl OroReseaApp {
                     return;
                 }
                 if let Some(path) = FileDialog::new()
-                    .set_file_name("OroResea-WDA-report.csv")
+                    .set_file_name("OroResea-static-capability-report.csv")
                     .add_filter("CSV report", &["csv"])
                     .save_file()
                 {
@@ -381,7 +408,7 @@ impl OroReseaApp {
                     return;
                 }
                 if let Some(path) = FileDialog::new()
-                    .set_file_name("OroResea-WDA-report.html")
+                    .set_file_name("OroResea-static-capability-report.html")
                     .add_filter("HTML report", &["html"])
                     .save_file()
                 {
@@ -440,7 +467,9 @@ impl OroReseaApp {
                     ui.vertical(|ui| {
                         ui.label(RichText::new("OroResea").size(22.0).strong().color(TEXT));
                         ui.label(
-                            RichText::new("Windows WDA evidence and protection-posture analyzer")
+                            RichText::new(
+                                "Windows capture-protection capability and process-posture analyzer",
+                            )
                                 .size(12.0)
                                 .color(MUTED),
                         );
@@ -487,7 +516,7 @@ impl OroReseaApp {
                     );
                     let wda = ui.selectable_label(
                         self.mode == AppMode::WdaEvidence,
-                        RichText::new("WDA Evidence").strong(),
+                        RichText::new("Static Capabilities").strong(),
                     );
                     if wda.clicked() {
                         self.mode = AppMode::WdaEvidence;
@@ -567,6 +596,33 @@ impl OroReseaApp {
                     }
                 });
 
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(RichText::new("SCAN FOR").size(10.0).strong().color(GOLD));
+                    ui.checkbox(&mut self.scan_wda, "WDA APIs and markers")
+                        .on_hover_text(
+                            "Set/GetWindowDisplayAffinity imports, dynamic bindings, strings, and named WDA markers.",
+                        );
+                    ui.checkbox(
+                        &mut self.scan_process_mitigations,
+                        "CIG / mitigation APIs",
+                    )
+                    .on_hover_text(
+                        "Set/GetProcessMitigationPolicy and signature-policy markers. Static evidence is capability only; live readback is required for effective CIG.",
+                    );
+                    ui.checkbox(&mut self.scan_dll_loading, "DLL search / loading APIs")
+                        .on_hover_text(
+                            "SetDefaultDllDirectories, SetDllDirectoryW, AddDllDirectory, and LoadLibrary variants.",
+                        );
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        ui.label(
+                            RichText::new("CAPABILITY SCAN • DOES NOT EXECUTE FILES")
+                                .size(9.5)
+                                .strong()
+                                .color(MUTED),
+                        );
+                    });
+                });
+
                 if self.scanning {
                     ui.add_space(7.0);
                     let fraction = if self.progress_total == 0 {
@@ -586,6 +642,7 @@ impl OroReseaApp {
 
     fn show_posture_target_panel(&mut self, root: &mut egui::Ui) {
         let mut refresh_for_filter_change = false;
+        let mut profile_changed = false;
         egui::Panel::top("posture_target")
             .frame(
                 egui::Frame::NONE
@@ -593,6 +650,88 @@ impl OroReseaApp {
                     .inner_margin(egui::Margin::symmetric(20, 12)),
             )
             .show(root, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(RichText::new("PROFILE").size(10.0).strong().color(GOLD));
+                    if ui
+                        .selectable_label(
+                            self.posture_profile == AssessmentProfile::Generic,
+                            "Generic posture",
+                        )
+                        .clicked()
+                    {
+                        profile_changed = self.posture_profile != AssessmentProfile::Generic;
+                        self.posture_profile = AssessmentProfile::Generic;
+                    }
+                    let using_oronimbus =
+                        matches!(self.posture_profile, AssessmentProfile::OroNimbus(_));
+                    if ui
+                        .selectable_label(using_oronimbus, "OroNimbus lab")
+                        .on_hover_text(
+                            "Correlate exact WDA and MicrosoftSignedOnly CIG expectations against the selected PID. This does not trust the process name alone.",
+                        )
+                        .clicked()
+                        && !using_oronimbus
+                    {
+                        self.posture_profile =
+                            AssessmentProfile::OroNimbus(OroNimbusProfile::default());
+                        self.posture_query = "oronimbus".to_owned();
+                        profile_changed = true;
+                    }
+
+                    if let AssessmentProfile::OroNimbus(mut profile) = self.posture_profile {
+                        ui.separator();
+                        ui.label(RichText::new("Expected WDA").size(10.0).color(MUTED));
+                        egui::ComboBox::from_id_salt("oronimbus_expected_wda")
+                            .selected_text(profile.expected_wda.label())
+                            .show_ui(ui, |ui| {
+                                for value in [
+                                    OroNimbusWdaExpectation::ObserveOnly,
+                                    OroNimbusWdaExpectation::None,
+                                    OroNimbusWdaExpectation::Monitor,
+                                    OroNimbusWdaExpectation::ExcludeFromCapture,
+                                ] {
+                                    ui.selectable_value(
+                                        &mut profile.expected_wda,
+                                        value,
+                                        value.label(),
+                                    );
+                                }
+                            });
+                        ui.label(RichText::new("Expected CIG").size(10.0).color(MUTED));
+                        egui::ComboBox::from_id_salt("oronimbus_expected_cig")
+                            .selected_text(profile.expected_cig.label())
+                            .show_ui(ui, |ui| {
+                                for value in [
+                                    OroNimbusCigExpectation::ObserveOnly,
+                                    OroNimbusCigExpectation::Disabled,
+                                    OroNimbusCigExpectation::MicrosoftSignedOnly,
+                                ] {
+                                    ui.selectable_value(
+                                        &mut profile.expected_cig,
+                                        value,
+                                        value.label(),
+                                    );
+                                }
+                            });
+                        if self.posture_profile != AssessmentProfile::OroNimbus(profile) {
+                            profile_changed = true;
+                        }
+                        self.posture_profile = AssessmentProfile::OroNimbus(profile);
+                        if ui
+                            .button("Find OroNimbus")
+                            .on_hover_text(
+                                "Refresh all processes and apply an OroNimbus text filter. Select the PID that owns the visible browser window.",
+                            )
+                            .clicked()
+                        {
+                            self.posture_query = "oronimbus".to_owned();
+                            self.posture_visible_only = false;
+                            refresh_for_filter_change = true;
+                        }
+                    }
+                });
+                ui.add_space(3.0);
+
                 ui.horizontal(|ui| {
                     ui.label(RichText::new("STATIC FILE").size(10.0).strong().color(GOLD));
                     let width = (ui.available_width() - 245.0).max(180.0);
@@ -675,6 +814,19 @@ impl OroReseaApp {
 
         if refresh_for_filter_change {
             self.refresh_processes();
+        }
+        if profile_changed {
+            self.posture_assessment = None;
+            self.posture_status = match self.posture_profile {
+                AssessmentProfile::Generic => {
+                    "Generic posture profile selected. Choose a file or process.".to_owned()
+                }
+                AssessmentProfile::OroNimbus(profile) => format!(
+                    "OroNimbus profile selected: WDA {}, CIG {}. Select the main/WDA-owner PID and snapshot it.",
+                    profile.expected_wda.label(),
+                    profile.expected_cig.label()
+                ),
+            };
         }
     }
 
@@ -855,7 +1007,12 @@ impl OroReseaApp {
                     .auto_shrink([false, false])
                     .max_height(ui.available_height())
                     .show(ui, |ui| {
-                        for scope in [AuditScope::Static, AuditScope::Live, AuditScope::System] {
+                        for scope in [
+                            AuditScope::Profile,
+                            AuditScope::Static,
+                            AuditScope::Live,
+                            AuditScope::System,
+                        ] {
                             let checks: Vec<&PostureCheck> = assessment
                                 .checks
                                 .iter()
@@ -1104,8 +1261,8 @@ impl OroReseaApp {
                             ui,
                             RiskLevel::Clean,
                             100,
-                            "No WDA evidence found",
-                            "No direct import, dynamic-resolution pattern, API string, or named WDA marker was identified. This is not a guarantee that packed or runtime-generated behavior is absent.",
+                            "No selected capability evidence found",
+                            "No matching import, dynamic-resolution pattern, API string, or selected marker was identified. This is not a guarantee that packed or runtime-generated behavior is absent.",
                         );
                     } else {
                         for finding in &result.findings {
@@ -1137,7 +1294,7 @@ impl OroReseaApp {
             .default_width(610.0)
             .show(ctx, |ui| {
                 ui.label(
-                    RichText::new("WDA evidence mode")
+                    RichText::new("Static capability mode")
                         .size(17.0)
                         .strong()
                         .color(TEXT),
@@ -1147,6 +1304,8 @@ impl OroReseaApp {
                 methodology_row(ui, RiskLevel::Medium, "Embedded API name combined with GetProcAddress or LdrGetProcedureAddress evidence.");
                 methodology_row(ui, RiskLevel::Low, "API-name or WDA marker text without a confirmed call mechanism.");
                 methodology_row(ui, RiskLevel::Informational, "GetWindowDisplayAffinity can inspect protection but does not apply it.");
+                methodology_row(ui, RiskLevel::Informational, "Set/GetProcessMitigationPolicy imports show mitigation capability or inspection only. Effective CIG requires live Windows policy readback.");
+                methodology_row(ui, RiskLevel::Informational, "DLL search and LoadLibrary imports are capability evidence. They do not prove a hardening call succeeded or that a load was hostile.");
                 ui.separator();
                 ui.label(
                     RichText::new("Protection posture mode")
@@ -1390,7 +1549,10 @@ fn draw_process_row(ui: &mut egui::Ui, process: &ProcessSummary, selected: bool)
     painter.text(
         rect.left_top() + Vec2::new(9.0, 26.0),
         egui::Align2::LEFT_TOP,
-        format!("{} threads  •  {window_text}", process.thread_count),
+        format!(
+            "PPID {}  •  {} threads  •  {window_text}",
+            process.parent_pid, process.thread_count
+        ),
         FontId::proportional(10.0),
         MUTED,
     );
@@ -1549,7 +1711,7 @@ fn draw_result_row(ui: &mut egui::Ui, result: &ScanResult, selected: bool) -> eg
         .first()
         .map(|finding| finding.title.as_str())
         .or(result.error.as_deref())
-        .unwrap_or("No WDA evidence found");
+        .unwrap_or("No selected capability evidence found");
     let values = [
         result.highest_level.label().to_owned(),
         result.file_name.clone(),

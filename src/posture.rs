@@ -4,7 +4,9 @@ use crate::{
         ProcessInspection, ProcessSummary,
     },
     model::{
-        AuditScope, PostureAssessment, PostureCheck, PostureTarget, PostureVerdict, ProtectionKind,
+        AssessmentProfile, AuditScope, OroNimbusCigExpectation, OroNimbusProfile,
+        OroNimbusWdaExpectation, PostureAssessment, PostureCheck, PostureTarget, PostureVerdict,
+        ProtectionKind,
     },
     static_posture::{self, AuthenticodeStatus, StaticPosture, StaticPostureError},
 };
@@ -44,23 +46,33 @@ pub fn enumerate_processes(visible_only: bool) -> Result<Vec<ProcessSummary>, St
     }
 }
 
-pub fn spawn_file_assessment(path: PathBuf) -> Receiver<PostureMessage> {
+pub fn spawn_file_assessment_with_profile(
+    path: PathBuf,
+    profile: AssessmentProfile,
+) -> Receiver<PostureMessage> {
     let (tx, rx) = mpsc::channel();
     thread::spawn(move || {
-        let _ = tx.send(PostureMessage::Finished(assess_file(&path)));
+        let _ = tx.send(PostureMessage::Finished(assess_file_with_profile(
+            &path, profile,
+        )));
     });
     rx
 }
 
-pub fn spawn_process_assessment(pid: u32) -> Receiver<PostureMessage> {
+pub fn spawn_process_assessment_with_profile(
+    pid: u32,
+    profile: AssessmentProfile,
+) -> Receiver<PostureMessage> {
     let (tx, rx) = mpsc::channel();
     thread::spawn(move || {
-        let _ = tx.send(PostureMessage::Finished(assess_process(pid)));
+        let _ = tx.send(PostureMessage::Finished(assess_process_with_profile(
+            pid, profile,
+        )));
     });
     rx
 }
 
-pub fn assess_file(path: &Path) -> PostureAssessment {
+pub fn assess_file_with_profile(path: &Path, profile: AssessmentProfile) -> PostureAssessment {
     let mut checks = Vec::new();
     let mut limitations = base_limitations();
     match static_posture::analyze_path(path) {
@@ -68,6 +80,9 @@ pub fn assess_file(path: &Path) -> PostureAssessment {
         Err(error) => append_static_error_checks(&mut checks, &error),
     }
     append_not_running_checks(&mut checks);
+    if let AssessmentProfile::OroNimbus(expected) = profile {
+        append_oronimbus_file_profile(&mut checks, path, expected);
+    }
     append_system_gaps(&mut checks);
     limitations.push(
         "No target was executed. Effective process policies and runtime WDA require a live-process snapshot."
@@ -75,6 +90,7 @@ pub fn assess_file(path: &Path) -> PostureAssessment {
     );
 
     PostureAssessment {
+        profile,
         target: PostureTarget {
             path: Some(path.to_owned()),
             pid: None,
@@ -89,7 +105,12 @@ pub fn assess_file(path: &Path) -> PostureAssessment {
     }
 }
 
+#[cfg(test)]
 pub fn assess_process(pid: u32) -> PostureAssessment {
+    assess_process_with_profile(pid, AssessmentProfile::Generic)
+}
+
+pub fn assess_process_with_profile(pid: u32, profile: AssessmentProfile) -> PostureAssessment {
     let inspection = live_posture::inspect_process(pid);
     let path = inspection
         .executable_path
@@ -115,6 +136,17 @@ pub fn assess_process(pid: u32) -> PostureAssessment {
     }
 
     append_live_checks(&mut checks, &inspection);
+    if let AssessmentProfile::OroNimbus(expected) = profile {
+        append_oronimbus_live_profile(&mut checks, &inspection, expected);
+        limitations.push(
+            "The OroNimbus profile independently reads Windows state for the selected PID. It does not import OroNimbus's internal watchdog counters, Chromium role labels, or CIG probe history."
+                .to_owned(),
+        );
+        limitations.push(
+            "OroNimbus v0.5.0 applies CIG post-bootstrap to its main/WDA-owner PID. A selected child PID is not expected to inherit that policy automatically."
+                .to_owned(),
+        );
+    }
     append_system_gaps(&mut checks);
     limitations.push(
         "This is a point-in-time snapshot. A later policy change, module load, or injection attempt is not covered."
@@ -134,6 +166,7 @@ pub fn assess_process(pid: u32) -> PostureAssessment {
     );
 
     PostureAssessment {
+        profile,
         target: PostureTarget {
             path,
             pid: Some(pid),
@@ -998,6 +1031,434 @@ fn visible_window_affinity_verdict(
     }
 }
 
+fn append_oronimbus_file_profile(
+    checks: &mut Vec<PostureCheck>,
+    path: &Path,
+    profile: OroNimbusProfile,
+) {
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("unknown");
+    let recognized_role = if file_name.eq_ignore_ascii_case("OroNimbus.exe") {
+        Some("Electron host executable")
+    } else if file_name.eq_ignore_ascii_case("wda_native.node") {
+        Some("native WDA/CIG bridge")
+    } else if file_name.eq_ignore_ascii_case("cig_probe_unsigned.node") {
+        Some("packaged unsigned CIG control image")
+    } else {
+        None
+    };
+    checks.push(check(
+        ProtectionKind::OroNimbusIdentity,
+        AuditScope::Profile,
+        if recognized_role.is_some() {
+            PostureVerdict::Pass
+        } else {
+            PostureVerdict::Warning
+        },
+        "OroNimbus package component",
+        recognized_role.map_or_else(
+            || {
+                "The selected file is not one of the standard OroNimbus component names. A renamed or additional component can still be legitimate, so this is not a maliciousness verdict."
+                    .to_owned()
+            },
+            |role| format!("The selected file matches the standard OroNimbus {role} name."),
+        ),
+        Some(format!("file={} | path={}", file_name, path.display())),
+        None,
+    ));
+    checks.push(check(
+        ProtectionKind::WdaRuntimeAffinity,
+        AuditScope::Profile,
+        PostureVerdict::Unknown,
+        "Expected OroNimbus WDA",
+        format!(
+            "Expected mode: {}. A file-only assessment cannot establish a window's runtime display affinity.",
+            profile.expected_wda.label()
+        ),
+        None,
+        None,
+    ));
+    checks.push(check(
+        ProtectionKind::BinarySignaturePolicy,
+        AuditScope::Profile,
+        PostureVerdict::Unknown,
+        "Expected OroNimbus CIG",
+        format!(
+            "Expected state: {}. CIG is an effective process policy and cannot be confirmed from ordinary PE header metadata.",
+            profile.expected_cig.label()
+        ),
+        None,
+        None,
+    ));
+    append_unverified_dll_search_profile(checks);
+}
+
+fn append_oronimbus_live_profile(
+    checks: &mut Vec<PostureCheck>,
+    inspection: &ProcessInspection,
+    profile: OroNimbusProfile,
+) {
+    append_oronimbus_identity_check(checks, inspection);
+    append_oronimbus_scope_check(checks, inspection);
+    append_oronimbus_wda_check(checks, inspection, profile.expected_wda);
+    append_oronimbus_cig_check(checks, inspection, profile.expected_cig);
+    append_oronimbus_bridge_check(checks, inspection);
+    append_unverified_dll_search_profile(checks);
+}
+
+fn append_oronimbus_identity_check(checks: &mut Vec<PostureCheck>, inspection: &ProcessInspection) {
+    let name = inspection.executable_name.value.as_deref();
+    let path = inspection.executable_path.value.as_deref();
+    let name_match = name.is_some_and(|value| value.eq_ignore_ascii_case("OroNimbus.exe"));
+    let path_match = path.is_some_and(|value| {
+        let normalized = value.replace('/', "\\").to_ascii_lowercase();
+        normalized.contains("\\oronimbus\\")
+            || normalized.contains("\\oronimbus-x86\\")
+            || normalized.ends_with("\\oronimbus.exe")
+    });
+    let (verdict, detail) = match (name_match, path_match) {
+        (true, true) => (
+            PostureVerdict::Pass,
+            "The selected PID has the expected executable name and an OroNimbus package path. Path and name are supporting identity evidence, not publisher authentication.",
+        ),
+        (true, false) => (
+            PostureVerdict::Warning,
+            "The process name matches OroNimbus, but the package path did not match or was unavailable. Confirm the full path before treating it as the lab instance.",
+        ),
+        (false, true) => (
+            PostureVerdict::Warning,
+            "The executable is under an OroNimbus-looking package path but its process name differs. Confirm whether this is an expected renamed component.",
+        ),
+        (false, false) => (
+            PostureVerdict::Warning,
+            "The selected PID is not independently identified as an OroNimbus package process by its current name and path.",
+        ),
+    };
+    checks.push(check(
+        ProtectionKind::OroNimbusIdentity,
+        AuditScope::Profile,
+        verdict,
+        "Selected OroNimbus identity",
+        detail,
+        Some(format!(
+            "pid={} | name={} | path={}",
+            inspection.pid,
+            name.unwrap_or("unavailable"),
+            path.unwrap_or("unavailable")
+        )),
+        inspection
+            .executable_path
+            .message
+            .clone()
+            .or_else(|| inspection.executable_name.message.clone()),
+    ));
+}
+
+fn append_oronimbus_scope_check(checks: &mut Vec<PostureCheck>, inspection: &ProcessInspection) {
+    let (verdict, detail, evidence, error) = match inspection.windows.value.as_ref() {
+        Some(windows) => {
+            let visible = windows.iter().filter(|window| window.visible).count();
+            if visible > 0 {
+                (
+                    PostureVerdict::Pass,
+                    "The selected PID owns a visible top-level window and is therefore a plausible OroNimbus main/WDA-owner process. Exact Chromium role names still require OroNimbus self-telemetry."
+                        .to_owned(),
+                    Some(format!(
+                        "top_level_windows={} | visible_windows={visible}",
+                        windows.len()
+                    )),
+                    None,
+                )
+            } else {
+                (
+                    PostureVerdict::Warning,
+                    "The selected PID owns no visible top-level window. It may be an OroNimbus child process; main-process WDA and CIG expectations should not automatically be applied to Chromium children."
+                        .to_owned(),
+                    Some(format!("top_level_windows={} | visible_windows=0", windows.len())),
+                    None,
+                )
+            }
+        }
+        None => (
+            PostureVerdict::Unavailable,
+            "Top-level-window ownership could not be read, so OroResea cannot classify this PID as the likely WDA owner."
+                .to_owned(),
+            None,
+            inspection.windows.message.clone(),
+        ),
+    };
+    checks.push(check(
+        ProtectionKind::OroNimbusScope,
+        AuditScope::Profile,
+        verdict,
+        "Selected PID scope",
+        detail,
+        evidence,
+        error,
+    ));
+}
+
+fn append_oronimbus_wda_check(
+    checks: &mut Vec<PostureCheck>,
+    inspection: &ProcessInspection,
+    expected: OroNimbusWdaExpectation,
+) {
+    let Some(windows) = inspection.windows.value.as_ref() else {
+        checks.push(check(
+            ProtectionKind::WdaRuntimeAffinity,
+            AuditScope::Profile,
+            PostureVerdict::Unavailable,
+            "OroNimbus WDA correlation",
+            format!(
+                "Expected mode: {}. Window affinity could not be read for the selected PID.",
+                expected.label()
+            ),
+            None,
+            inspection.windows.message.clone(),
+        ));
+        return;
+    };
+
+    let visible: Vec<_> = windows.iter().filter(|window| window.visible).collect();
+    if visible.is_empty() {
+        checks.push(check(
+            ProtectionKind::WdaRuntimeAffinity,
+            AuditScope::Profile,
+            PostureVerdict::Unavailable,
+            "OroNimbus WDA correlation",
+            "The selected PID owns no visible top-level window. WDA is expected only on the OroNimbus main/WDA-owner HWND.",
+            Some("visible_windows=0".to_owned()),
+            None,
+        ));
+        return;
+    }
+
+    let mut raw_values = Vec::new();
+    let mut unavailable = 0usize;
+    let mut evidence = Vec::new();
+    for window in visible {
+        match window.display_affinity.value.as_ref() {
+            Some(affinity) => {
+                raw_values.push(affinity.raw_value);
+                evidence.push(format!(
+                    "HWND 0x{:X}=0x{:X}",
+                    window.hwnd, affinity.raw_value
+                ));
+            }
+            None => {
+                unavailable += 1;
+                evidence.push(format!("HWND 0x{:X}=unavailable", window.hwnd));
+            }
+        }
+    }
+
+    let expected_raw = expected.raw_value();
+    let verdict = classify_oronimbus_wda(&raw_values, unavailable, expected);
+    let detail = if expected_raw.is_none() {
+        format!(
+            "Observed {} readable visible-window affinity value(s); no exact WDA mode was asserted by the profile.",
+            raw_values.len()
+        )
+    } else if unavailable > 0 {
+        format!(
+            "Expected {}, but at least one visible-window readback was unavailable. Missing evidence is not treated as WDA_NONE.",
+            expected.label()
+        )
+    } else if raw_values.iter().all(|value| Some(*value) == expected_raw) {
+        if expected == OroNimbusWdaExpectation::None {
+            "Observed WDA_NONE exactly as configured. This is a configuration match with capture protection disabled, not a protection pass."
+                .to_owned()
+        } else {
+            format!(
+                "Every readable visible HWND exactly matches {}.",
+                expected.label()
+            )
+        }
+    } else {
+        format!(
+            "The visible-window readback does not exactly match {}. MONITOR and EXCLUDE are intentionally treated as different modes.",
+            expected.label()
+        )
+    };
+    checks.push(check(
+        ProtectionKind::WdaRuntimeAffinity,
+        AuditScope::Profile,
+        verdict,
+        "OroNimbus WDA correlation",
+        detail,
+        Some(format!(
+            "expected={} | {}",
+            expected.label(),
+            evidence.join(" | ")
+        )),
+        None,
+    ));
+}
+
+fn classify_oronimbus_wda(
+    raw_values: &[u32],
+    unavailable: usize,
+    expected: OroNimbusWdaExpectation,
+) -> PostureVerdict {
+    let Some(expected_raw) = expected.raw_value() else {
+        return PostureVerdict::Informational;
+    };
+    if unavailable > 0 {
+        return PostureVerdict::Unavailable;
+    }
+    if raw_values.iter().all(|value| *value == expected_raw) {
+        if expected == OroNimbusWdaExpectation::None {
+            PostureVerdict::Informational
+        } else {
+            PostureVerdict::Pass
+        }
+    } else {
+        PostureVerdict::Warning
+    }
+}
+
+fn append_oronimbus_cig_check(
+    checks: &mut Vec<PostureCheck>,
+    inspection: &ProcessInspection,
+    expected: OroNimbusCigExpectation,
+) {
+    let finding = &inspection.mitigations.signature_policy_cig;
+    let Some(raw) = finding.raw_flags else {
+        checks.push(check(
+            ProtectionKind::BinarySignaturePolicy,
+            AuditScope::Profile,
+            if matches!(
+                finding.state,
+                EvidenceState::Unavailable | EvidenceState::AccessDenied
+            ) {
+                PostureVerdict::Unavailable
+            } else {
+                PostureVerdict::Error
+            },
+            "OroNimbus CIG correlation",
+            format!(
+                "Expected state: {}. Windows did not return binary-signature policy flags for this PID.",
+                expected.label()
+            ),
+            None,
+            finding.message.clone(),
+        ));
+        return;
+    };
+
+    let microsoft_only = raw & 0x1 != 0;
+    let store_only = raw & 0x2 != 0;
+    let opt_in = raw & 0x4 != 0;
+    let dependency_signing = raw & 0x20 != 0;
+    let verdict = classify_oronimbus_cig(raw, expected);
+    let detail = match expected {
+        OroNimbusCigExpectation::ObserveOnly =>
+            "The effective binary-signature policy was read independently; no exact OroNimbus CIG state was asserted."
+                .to_owned(),
+        OroNimbusCigExpectation::Disabled if !microsoft_only => {
+            if raw & 0x27 == 0 {
+                "MicrosoftSignedOnly is absent and no supported signature-enforcement bit is set. This matches CIG-off configuration; it is not a security pass."
+                    .to_owned()
+            } else {
+                "MicrosoftSignedOnly is absent, matching the requested OroNimbus CIG-off state, but another binary-signature enforcement bit is active and is reported separately."
+                    .to_owned()
+            }
+        }
+        OroNimbusCigExpectation::Disabled =>
+            "MicrosoftSignedOnly is active even though the profile expected OroNimbus CIG off. The policy may be pre-existing or externally imposed; OS readback cannot attribute its origin."
+                .to_owned(),
+        OroNimbusCigExpectation::MicrosoftSignedOnly if microsoft_only =>
+            "Windows reports the MicrosoftSignedOnly bit on the selected PID. This independently confirms effective policy readback, not OroNimbus's historical unsigned-probe outcome."
+                .to_owned(),
+        OroNimbusCigExpectation::MicrosoftSignedOnly =>
+            "The MicrosoftSignedOnly bit is absent. Other signature-policy bits do not count as an exact OroNimbus MicrosoftSignedOnly match."
+                .to_owned(),
+    };
+    checks.push(check(
+        ProtectionKind::BinarySignaturePolicy,
+        AuditScope::Profile,
+        verdict,
+        "OroNimbus CIG correlation",
+        detail,
+        Some(format!(
+            "expected={} | raw=0x{raw:08X} | microsoft_signed_only={microsoft_only} | store_signed_only={store_only} | mitigation_opt_in={opt_in} | dependency_signing={dependency_signing}",
+            expected.label()
+        )),
+        None,
+    ));
+}
+
+fn classify_oronimbus_cig(raw: u32, expected: OroNimbusCigExpectation) -> PostureVerdict {
+    let microsoft_only = raw & 0x1 != 0;
+    match expected {
+        OroNimbusCigExpectation::ObserveOnly => PostureVerdict::Informational,
+        OroNimbusCigExpectation::Disabled if !microsoft_only => PostureVerdict::Informational,
+        OroNimbusCigExpectation::Disabled => PostureVerdict::Warning,
+        OroNimbusCigExpectation::MicrosoftSignedOnly if microsoft_only => PostureVerdict::Pass,
+        OroNimbusCigExpectation::MicrosoftSignedOnly => PostureVerdict::Warning,
+    }
+}
+
+fn append_oronimbus_bridge_check(checks: &mut Vec<PostureCheck>, inspection: &ProcessInspection) {
+    let (verdict, detail, evidence, error) = match inspection.modules.value.as_ref() {
+        Some(modules) => {
+            let bridge = modules.paths.iter().find(|path| {
+                Path::new(path)
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.eq_ignore_ascii_case("wda_native.node"))
+            });
+            if let Some(path) = bridge {
+                (
+                    PostureVerdict::Pass,
+                    "The standard OroNimbus native WDA/CIG bridge is loader-visible in the selected PID. Presence supports component identity but does not prove every API call succeeded."
+                        .to_owned(),
+                    Some(path.clone()),
+                    None,
+                )
+            } else {
+                (
+                    PostureVerdict::Warning,
+                    "The standard wda_native.node path was not present in this point-in-time loader-visible inventory. The selected PID may be a child process or access/timing may differ."
+                        .to_owned(),
+                    Some(format!("module_count={}", modules.count)),
+                    None,
+                )
+            }
+        }
+        None => (
+            PostureVerdict::Unavailable,
+            "The loader-visible module inventory was unavailable, so the native bridge could not be correlated."
+                .to_owned(),
+            None,
+            inspection.modules.message.clone(),
+        ),
+    };
+    checks.push(check(
+        ProtectionKind::OroNimbusIdentity,
+        AuditScope::Profile,
+        verdict,
+        "OroNimbus native bridge",
+        detail,
+        evidence,
+        error,
+    ));
+}
+
+fn append_unverified_dll_search_profile(checks: &mut Vec<PostureCheck>) {
+    checks.push(check(
+        ProtectionKind::DllSearchHardening,
+        AuditScope::Profile,
+        PostureVerdict::Unknown,
+        "OroNimbus DLL-search hardening",
+        "OroNimbus uses SetDefaultDllDirectories and SetDllDirectoryW, but Windows does not expose that process-local search configuration through ProcessImageLoadPolicy. OroResea therefore keeps it unverified externally unless trusted OroNimbus self-evidence is imported.",
+        None,
+        None,
+    ));
+}
+
 fn append_system_gaps(checks: &mut Vec<PostureCheck>) {
     checks.push(check(
         ProtectionKind::Wdac,
@@ -1101,6 +1562,50 @@ mod tests {
         assert_eq!(
             visible_window_affinity_verdict(0, 0, 1),
             PostureVerdict::Unavailable
+        );
+    }
+
+    #[test]
+    fn oronimbus_wda_correlation_requires_the_exact_mode() {
+        assert_eq!(
+            classify_oronimbus_wda(&[0x11], 0, OroNimbusWdaExpectation::ExcludeFromCapture),
+            PostureVerdict::Pass
+        );
+        assert_eq!(
+            classify_oronimbus_wda(&[0x01], 0, OroNimbusWdaExpectation::ExcludeFromCapture),
+            PostureVerdict::Warning
+        );
+        assert_eq!(
+            classify_oronimbus_wda(&[0x00], 0, OroNimbusWdaExpectation::None),
+            PostureVerdict::Informational
+        );
+        assert_eq!(
+            classify_oronimbus_wda(&[0x11], 1, OroNimbusWdaExpectation::ExcludeFromCapture),
+            PostureVerdict::Unavailable
+        );
+    }
+
+    #[test]
+    fn oronimbus_cig_correlation_requires_microsoft_only_bit() {
+        assert_eq!(
+            classify_oronimbus_cig(0x05, OroNimbusCigExpectation::MicrosoftSignedOnly),
+            PostureVerdict::Pass
+        );
+        assert_eq!(
+            classify_oronimbus_cig(0x02, OroNimbusCigExpectation::MicrosoftSignedOnly),
+            PostureVerdict::Warning
+        );
+        assert_eq!(
+            classify_oronimbus_cig(0x20, OroNimbusCigExpectation::MicrosoftSignedOnly),
+            PostureVerdict::Warning
+        );
+        assert_eq!(
+            classify_oronimbus_cig(0x00, OroNimbusCigExpectation::Disabled),
+            PostureVerdict::Informational
+        );
+        assert_eq!(
+            classify_oronimbus_cig(0x01, OroNimbusCigExpectation::Disabled),
+            PostureVerdict::Warning
         );
     }
 }

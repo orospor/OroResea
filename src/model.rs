@@ -48,6 +48,9 @@ pub enum EvidenceKind {
     ApiString,
     WdaMarker,
     InspectionApi,
+    MitigationApi,
+    DllSearchHardening,
+    LoaderCapability,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -62,6 +65,7 @@ pub struct Evidence {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AuditScope {
+    Profile,
     Static,
     Live,
     System,
@@ -70,6 +74,7 @@ pub enum AuditScope {
 impl AuditScope {
     pub fn label(self) -> &'static str {
         match self {
+            Self::Profile => "ORONIMBUS PROFILE",
             Self::Static => "STATIC",
             Self::Live => "LIVE",
             Self::System => "SYSTEM",
@@ -106,6 +111,8 @@ impl PostureVerdict {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProtectionKind {
+    OroNimbusIdentity,
+    OroNimbusScope,
     WdaRuntimeAffinity,
     Dep,
     Aslr,
@@ -118,6 +125,7 @@ pub enum ProtectionKind {
     BinarySignaturePolicy,
     ExtensionPointPolicy,
     ImageLoadPolicy,
+    DllSearchHardening,
     ProcessProtection,
     Debugger,
     LoadedModules,
@@ -129,6 +137,8 @@ pub enum ProtectionKind {
 impl ProtectionKind {
     pub fn label(self) -> &'static str {
         match self {
+            Self::OroNimbusIdentity => "OroNimbus identity",
+            Self::OroNimbusScope => "OroNimbus process scope",
             Self::WdaRuntimeAffinity => "Runtime WDA",
             Self::Dep => "DEP",
             Self::Aslr => "ASLR",
@@ -141,6 +151,7 @@ impl ProtectionKind {
             Self::BinarySignaturePolicy => "Binary signature / CIG",
             Self::ExtensionPointPolicy => "Extension points",
             Self::ImageLoadPolicy => "Image loading",
+            Self::DllSearchHardening => "DLL search hardening",
             Self::ProcessProtection => "Process protection",
             Self::Debugger => "Debugger",
             Self::LoadedModules => "Loaded modules",
@@ -169,8 +180,79 @@ pub struct PostureTarget {
     pub process_name: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OroNimbusWdaExpectation {
+    ObserveOnly,
+    None,
+    Monitor,
+    ExcludeFromCapture,
+}
+
+impl OroNimbusWdaExpectation {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::ObserveOnly => "Observe only",
+            Self::None => "WDA_NONE",
+            Self::Monitor => "WDA_MONITOR",
+            Self::ExcludeFromCapture => "WDA_EXCLUDEFROMCAPTURE",
+        }
+    }
+
+    pub fn raw_value(self) -> Option<u32> {
+        match self {
+            Self::ObserveOnly => None,
+            Self::None => Some(0x00),
+            Self::Monitor => Some(0x01),
+            Self::ExcludeFromCapture => Some(0x11),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OroNimbusCigExpectation {
+    ObserveOnly,
+    Disabled,
+    MicrosoftSignedOnly,
+}
+
+impl OroNimbusCigExpectation {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::ObserveOnly => "Observe only",
+            Self::Disabled => "CIG off",
+            Self::MicrosoftSignedOnly => "MicrosoftSignedOnly",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OroNimbusProfile {
+    pub expected_wda: OroNimbusWdaExpectation,
+    pub expected_cig: OroNimbusCigExpectation,
+}
+
+impl Default for OroNimbusProfile {
+    fn default() -> Self {
+        Self {
+            expected_wda: OroNimbusWdaExpectation::ObserveOnly,
+            expected_cig: OroNimbusCigExpectation::ObserveOnly,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum AssessmentProfile {
+    #[default]
+    Generic,
+    OroNimbus(OroNimbusProfile),
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PostureAssessment {
+    pub profile: AssessmentProfile,
     pub target: PostureTarget,
     pub captured_unix_seconds: u64,
     pub checks: Vec<PostureCheck>,
@@ -198,6 +280,14 @@ impl PostureSummary {
     pub fn from_checks(checks: &[PostureCheck]) -> Self {
         let mut summary = Self::default();
         for check in checks {
+            // Profile checks compare a user-selected configuration with an
+            // observation. They are displayed and exported, but do not alter
+            // the generic protection-posture totals. In particular, matching
+            // an expected WDA_NONE or CIG-off configuration is not a security
+            // "pass".
+            if check.scope == AuditScope::Profile {
+                continue;
+            }
             match check.verdict {
                 PostureVerdict::Pass => summary.pass += 1,
                 PostureVerdict::Fail => summary.fail += 1,
@@ -312,5 +402,14 @@ mod tests {
         assert_eq!(summary.fail, 1);
         assert_eq!(summary.unavailable, 1);
         assert_eq!(summary.unknown, 1);
+    }
+
+    #[test]
+    fn profile_correlations_do_not_change_generic_posture_totals() {
+        let mut profile_check = check(PostureVerdict::Pass);
+        profile_check.scope = AuditScope::Profile;
+        let summary = PostureSummary::from_checks(&[profile_check, check(PostureVerdict::Warning)]);
+        assert_eq!(summary.pass, 0);
+        assert_eq!(summary.warning, 1);
     }
 }
