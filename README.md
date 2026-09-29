@@ -127,6 +127,21 @@ cargo build --release --locked --target x86_64-pc-windows-msvc
 The x64 executable is written to
 `target\x86_64-pc-windows-msvc\release\ororesea.exe`.
 
+## Install a packaged release
+
+Download and extract `OroResea-v0.3.0-x64.zip` from the GitHub release, then
+double-click `install.cmd`. The installer verifies `OroResea.exe` against the
+included SHA-256 manifest, installs it for the current user under
+`%LOCALAPPDATA%\Programs\OroResea`, and creates a Start Menu shortcut. It does
+not require administrator access.
+
+To choose another destination, open PowerShell in the extracted package and
+run:
+
+```powershell
+.\Install-OroResea.ps1 -InstallDirectory "D:\Tools\OroResea"
+```
+
 ## Use
 
 1. Start OroResea and choose **Static Capabilities** or **Protection Posture**.
