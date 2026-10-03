@@ -136,6 +136,12 @@ pub fn assess_process_with_profile(pid: u32, profile: AssessmentProfile) -> Post
     }
 
     append_live_checks(&mut checks, &inspection);
+    if inspection.java_app.is_some() {
+        limitations.push(
+            "For a Java application, Windows process mitigations and display affinity belong to the JVM host PID and its HWNDs. They are not independent policies on a JAR or main class."
+                .to_owned(),
+        );
+    }
     if let AssessmentProfile::OroNimbus(expected) = profile {
         append_oronimbus_live_profile(&mut checks, &inspection, expected);
         limitations.push(
@@ -580,6 +586,7 @@ fn append_dynamic_code_check(checks: &mut Vec<PostureCheck>, finding: &Mitigatio
 }
 
 fn append_live_checks(checks: &mut Vec<PostureCheck>, inspection: &ProcessInspection) {
+    append_java_app_identity(checks, inspection);
     let mitigations = &inspection.mitigations;
     append_mitigation_check(
         checks,
@@ -660,6 +667,46 @@ fn append_live_checks(checks: &mut Vec<PostureCheck>, inspection: &ProcessInspec
     append_module_inventory(checks, inspection);
     append_memory_snapshot(checks, inspection);
     append_window_affinity(checks, inspection);
+}
+
+fn append_java_app_identity(checks: &mut Vec<PostureCheck>, inspection: &ProcessInspection) {
+    let Some(evidence) = &inspection.java_app else {
+        return;
+    };
+    let Some(identity) = evidence.value.as_ref() else {
+        return;
+    };
+    let (verdict, target) = match (&identity.launch_target, identity.command_line_state) {
+        (Some(target), _) => (
+            PostureVerdict::Informational,
+            format!("{}: {target}", identity.launch_kind.label()),
+        ),
+        (_, EvidenceState::AccessDenied | EvidenceState::Unavailable) => (
+            PostureVerdict::Unavailable,
+            "Launch target unavailable from Win32_Process".to_owned(),
+        ),
+        (_, EvidenceState::Error) => (
+            PostureVerdict::Error,
+            "Launch target query failed".to_owned(),
+        ),
+        _ => (PostureVerdict::Unknown, "Launch target unknown".to_owned()),
+    };
+    checks.push(check(
+        ProtectionKind::JvmApplicationIdentity,
+        AuditScope::Live,
+        verdict,
+        "JVM application identity",
+        format!(
+            "{}. {target}. Windows mitigations and WDA are observed on this host process and its windows, not on a JAR independently.",
+            if identity.runtime_confirmed {
+                "A loaded jvm.dll confirms the selected PID hosts a JVM"
+            } else {
+                "The executable path or jpackage layout indicates a Java application; a loaded JVM module was not confirmed"
+            }
+        ),
+        Some(identity.identity_basis.clone()),
+        identity.command_line_message.clone(),
+    ));
 }
 
 fn append_protection_level(checks: &mut Vec<PostureCheck>, inspection: &ProcessInspection) {

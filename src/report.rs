@@ -14,8 +14,15 @@ struct Report<'a> {
     generated_unix_seconds: u64,
     source: &'a str,
     summary: ReportSummary,
+    limitations: Vec<&'static str>,
     results: &'a [ScanResult],
 }
+
+const JAVA_REPORT_LIMITATIONS: &[&str] = &[
+    "Static references and bundled native binaries do not establish which Java classes or native methods execute at runtime.",
+    "Windows display affinity and process mitigations apply to a running JVM process and its windows, not independently to a JAR or class file.",
+    "The embedded_signature field describes a Windows PE certificate table; false is not a Java archive-signature verdict.",
+];
 
 fn report<'a>(source: &'a str, results: &'a [ScanResult]) -> Report<'a> {
     Report {
@@ -27,7 +34,16 @@ fn report<'a>(source: &'a str, results: &'a [ScanResult]) -> Report<'a> {
             .as_secs(),
         source,
         summary: ReportSummary::from_results(results),
+        limitations: static_report_limitations(results),
         results,
+    }
+}
+
+fn static_report_limitations(results: &[ScanResult]) -> Vec<&'static str> {
+    if results.iter().any(is_java_artifact) {
+        JAVA_REPORT_LIMITATIONS.to_vec()
+    } else {
+        Vec::new()
     }
 }
 
@@ -76,7 +92,11 @@ pub fn write_csv(path: &Path, results: &[ScanResult]) -> Result<(), String> {
                 result.architecture.clone(),
                 result.size_bytes.to_string(),
                 result.sha256.clone(),
-                result.embedded_signature.to_string(),
+                if is_java_artifact(result) {
+                    String::new()
+                } else {
+                    result.embedded_signature.to_string()
+                },
                 evidence,
                 result.error.clone().unwrap_or_default(),
             ])
@@ -96,7 +116,7 @@ pub fn write_html(path: &Path, source: &str, results: &[ScanResult]) -> Result<(
     .map_err(io_error)?;
     write!(
         file,
-        "<header><div class=\"brand\">OR</div><div><h1>OroResea analysis report</h1><p>Read-only static Windows protection-capability scan</p></div></header><main><section class=\"source\"><b>Source</b><code>{}</code></section>",
+        "<header><div class=\"brand\">OR</div><div><h1>OroResea analysis report</h1><p>Read-only static Windows PE and Java capability scan</p></div></header><main><section class=\"source\"><b>Source</b><code>{}</code></section>",
         escape_html(source)
     )
     .map_err(io_error)?;
@@ -113,7 +133,7 @@ pub fn write_html(path: &Path, source: &str, results: &[ScanResult]) -> Result<(
         let level = result.highest_level.label().to_ascii_lowercase();
         write!(
             file,
-            "<article><div class=\"row\"><span class=\"badge {}\">{}</span><div><h2>{}</h2><code>{}</code></div></div><dl><dt>Type</dt><dd>{}</dd><dt>Architecture</dt><dd>{}</dd><dt>SHA-256</dt><dd class=\"hash\">{}</dd><dt>Signature blob</dt><dd>{}</dd></dl>",
+            "<article><div class=\"row\"><span class=\"badge {}\">{}</span><div><h2>{}</h2><code>{}</code></div></div><dl><dt>Type</dt><dd>{}</dd><dt>Architecture</dt><dd>{}</dd><dt>SHA-256</dt><dd class=\"hash\">{}</dd><dt>PE signature blob</dt><dd>{}</dd></dl>",
             level,
             escape_html(result.highest_level.label()),
             escape_html(&result.file_name),
@@ -121,7 +141,13 @@ pub fn write_html(path: &Path, source: &str, results: &[ScanResult]) -> Result<(
             escape_html(&result.file_kind),
             escape_html(&result.architecture),
             escape_html(&result.sha256),
-            if result.embedded_signature { "Present (not trust-validated)" } else { "Not found" },
+            if is_java_artifact(result) {
+                "Not applicable to Java artifact"
+            } else if result.embedded_signature {
+                "Present (not trust-validated)"
+            } else {
+                "Not found"
+            },
         )
         .map_err(io_error)?;
         for finding in &result.findings {
@@ -145,8 +171,21 @@ pub fn write_html(path: &Path, source: &str, results: &[ScanResult]) -> Result<(
         file.write_all(b"</article>").map_err(io_error)?;
     }
 
-    file.write_all(b"</section><footer>OroResea reports static evidence, not proof of runtime behavior. No inspected binary was executed.</footer></main></body></html>")
+    let limitations = static_report_limitations(results);
+    if !limitations.is_empty() {
+        file.write_all(b"</section><section class=\"results\"><h2>LIMITATIONS</h2><article><ul>")
+            .map_err(io_error)?;
+        for limitation in limitations {
+            write!(file, "<li>{}</li>", escape_html(limitation)).map_err(io_error)?;
+        }
+        file.write_all(b"</ul></article>").map_err(io_error)?;
+    }
+    file.write_all(b"</section><footer>OroResea reports static evidence, not proof of runtime behavior. No inspected artifact was executed.</footer></main></body></html>")
         .map_err(io_error)
+}
+
+fn is_java_artifact(result: &ScanResult) -> bool {
+    result.file_kind.starts_with("Java ")
 }
 
 #[derive(Serialize)]
@@ -437,6 +476,40 @@ mod tests {
                 .unwrap()
                 .contains("OroResea analysis report")
         );
+
+        let _ = fs::remove_file(json_path);
+        let _ = fs::remove_file(csv_path);
+        let _ = fs::remove_file(html_path);
+    }
+
+    #[test]
+    fn java_reports_do_not_call_pe_certificate_absence_unsigned() {
+        let mut java = sample_result();
+        java.path = PathBuf::from(r"C:\sample\client.jar");
+        java.file_name = "client.jar".to_owned();
+        java.file_kind = "Java archive (JAR)".to_owned();
+        java.architecture = "JVM bytecode".to_owned();
+        let results = vec![java];
+        let json_path = unique_report_path("java-semantics", "json");
+        let csv_path = unique_report_path("java-semantics", "csv");
+        let html_path = unique_report_path("java-semantics", "html");
+
+        write_json(&json_path, r"C:\sample\client.jar", &results).unwrap();
+        write_csv(&csv_path, &results).unwrap();
+        write_html(&html_path, r"C:\sample\client.jar", &results).unwrap();
+
+        let json: serde_json::Value =
+            serde_json::from_reader(File::open(&json_path).unwrap()).unwrap();
+        assert!(
+            json["limitations"]
+                .as_array()
+                .is_some_and(|items| !items.is_empty())
+        );
+        let mut csv = csv::Reader::from_path(&csv_path).unwrap();
+        assert_eq!(csv.records().next().unwrap().unwrap().get(8), Some(""));
+        let html = fs::read_to_string(&html_path).unwrap();
+        assert!(html.contains("Not applicable to Java artifact"));
+        assert!(html.contains("JVM process"));
 
         let _ = fs::remove_file(json_path);
         let _ = fs::remove_file(csv_path);

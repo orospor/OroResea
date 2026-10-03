@@ -93,6 +93,45 @@ pub struct ProcessSummary {
     pub executable_name: String,
     pub executable_path: Evidence<String>,
     pub windows: Evidence<WindowCounts>,
+    /// Present only when the executable path or a loaded JVM module supports
+    /// treating this process as a Java host.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub java_app: Option<Evidence<JavaAppIdentity>>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum JavaLaunchKind {
+    Jar,
+    Module,
+    MainClass,
+    SourceFile,
+    Unknown,
+}
+
+impl JavaLaunchKind {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Jar => "JAR",
+            Self::Module => "module",
+            Self::MainClass => "main class",
+            Self::SourceFile => "source file",
+            Self::Unknown => "unknown target",
+        }
+    }
+}
+
+/// The JVM application target, without the remaining command-line arguments.
+/// Launcher arguments can contain credentials, so they are never retained here.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct JavaAppIdentity {
+    pub launch_kind: JavaLaunchKind,
+    pub launch_target: Option<String>,
+    pub identity_basis: String,
+    /// True only when the selected process's module inventory contains jvm.dll.
+    pub runtime_confirmed: bool,
+    pub command_line_state: EvidenceState,
+    pub command_line_message: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -254,6 +293,8 @@ pub struct ProcessInspection {
     pub pid: u32,
     pub executable_name: Evidence<String>,
     pub executable_path: Evidence<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub java_app: Option<Evidence<JavaAppIdentity>>,
     pub mitigations: MitigationPosture,
     pub protection_level: Evidence<ProtectionLevel>,
     /// `Enabled` means a debugger was reported present; `Disabled` means none
@@ -343,10 +384,208 @@ fn classify_display_affinity_state(
     }
 }
 
+fn is_java_launcher_name(name: &str) -> bool {
+    name.eq_ignore_ascii_case("java.exe") || name.eq_ignore_ascii_case("javaw.exe")
+}
+
+fn is_java_runtime_path(path: &str) -> bool {
+    let normalized = path.replace('/', "\\");
+    let lower = normalized.to_ascii_lowercase();
+    lower.ends_with("\\bin\\java.exe") || lower.ends_with("\\bin\\javaw.exe")
+}
+
+fn has_jvm_module(modules: &Evidence<ModuleInventory>) -> bool {
+    modules.value.as_ref().is_some_and(|inventory| {
+        inventory.paths.iter().any(|path| {
+            path.rsplit(['\\', '/'])
+                .next()
+                .is_some_and(|name| name.eq_ignore_ascii_case("jvm.dll"))
+        })
+    })
+}
+
+// Split only to locate a Java launcher target. No complete command line or
+// application arguments are retained in the result or exported assessment.
+fn windows_command_line_tokens(command_line: &str) -> Vec<String> {
+    let chars: Vec<char> = command_line.chars().collect();
+    let mut tokens = Vec::new();
+    let mut index = 0;
+    while index < chars.len() {
+        while index < chars.len() && chars[index].is_whitespace() {
+            index += 1;
+        }
+        if index == chars.len() {
+            break;
+        }
+        let mut token = String::new();
+        let mut quoted = false;
+        while index < chars.len() && (quoted || !chars[index].is_whitespace()) {
+            if chars[index] == '\\' {
+                let start = index;
+                while index < chars.len() && chars[index] == '\\' {
+                    index += 1;
+                }
+                let slashes = index - start;
+                if index < chars.len() && chars[index] == '"' {
+                    token.extend(std::iter::repeat_n('\\', slashes / 2));
+                    if slashes % 2 == 1 {
+                        token.push('"');
+                        index += 1;
+                    }
+                } else {
+                    token.extend(std::iter::repeat_n('\\', slashes));
+                }
+                if index >= chars.len() || chars[index] != '"' {
+                    continue;
+                }
+            }
+            if chars[index] == '"' {
+                if quoted && index + 1 < chars.len() && chars[index + 1] == '"' {
+                    token.push('"');
+                    index += 2;
+                } else {
+                    quoted = !quoted;
+                    index += 1;
+                }
+            } else {
+                token.push(chars[index]);
+                index += 1;
+            }
+        }
+        tokens.push(token);
+    }
+    tokens
+}
+
+fn parse_java_launch_target(command_line: &str) -> (JavaLaunchKind, Option<String>) {
+    let tokens = windows_command_line_tokens(command_line);
+    let mut arguments = tokens.iter().skip(1).peekable();
+    while let Some(argument) = arguments.next() {
+        let value = argument.as_str();
+        if matches!(value, "-jar" | "-m" | "--module") {
+            let kind = if value == "-jar" {
+                JavaLaunchKind::Jar
+            } else {
+                JavaLaunchKind::Module
+            };
+            return (
+                kind,
+                arguments
+                    .next()
+                    .filter(|target| !target.is_empty())
+                    .cloned(),
+            );
+        }
+        if let Some(target) = value.strip_prefix("--module=") {
+            return (JavaLaunchKind::Module, Some(target.to_owned()));
+        }
+        if value.starts_with('@') {
+            // An argument file may supply the actual launch target. Do not
+            // claim that a later token names the application.
+            break;
+        }
+        if matches!(
+            value,
+            "-cp"
+                | "-classpath"
+                | "--class-path"
+                | "-p"
+                | "--module-path"
+                | "--upgrade-module-path"
+                | "--add-modules"
+                | "--limit-modules"
+                | "--add-exports"
+                | "--add-opens"
+                | "--add-reads"
+                | "--patch-module"
+                | "--enable-native-access"
+                | "--source"
+        ) {
+            if arguments.next().is_none() {
+                break;
+            }
+            continue;
+        }
+        if value.starts_with("--") && value.contains('=') {
+            continue;
+        }
+        if value.starts_with("-D")
+            || value.starts_with("-X")
+            || value.starts_with("-XX:")
+            || value.starts_with("-javaagent:")
+            || value.starts_with("-agentlib:")
+            || value.starts_with("-agentpath:")
+            || matches!(
+                value,
+                "-server"
+                    | "-client"
+                    | "-ea"
+                    | "-da"
+                    | "-esa"
+                    | "-dsa"
+                    | "--enable-preview"
+                    | "--dry-run"
+            )
+        {
+            continue;
+        }
+        if value.starts_with('-') || value.is_empty() {
+            break;
+        }
+        let kind = if value.to_ascii_lowercase().ends_with(".java") {
+            JavaLaunchKind::SourceFile
+        } else {
+            JavaLaunchKind::MainClass
+        };
+        return (kind, Some(value.to_owned()));
+    }
+    (JavaLaunchKind::Unknown, None)
+}
+
+fn parse_jpackage_config(contents: &str) -> (JavaLaunchKind, Option<String>) {
+    let mut in_application = false;
+    let mut main_class = None;
+    for line in contents.lines() {
+        let line = line.trim();
+        if line.starts_with('[') && line.ends_with(']') {
+            in_application = line.eq_ignore_ascii_case("[Application]");
+            continue;
+        }
+        if !in_application {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let value = value.trim();
+        if value.is_empty() {
+            continue;
+        }
+        if key.trim().eq_ignore_ascii_case("app.mainmodule") {
+            return (JavaLaunchKind::Module, Some(value.to_owned()));
+        }
+        if key.trim().eq_ignore_ascii_case("app.mainclass") {
+            main_class = Some(value.to_owned());
+        }
+    }
+    match main_class {
+        Some(class) => (JavaLaunchKind::MainClass, Some(class)),
+        None => (JavaLaunchKind::Unknown, None),
+    }
+}
+
 #[cfg(windows)]
 mod platform {
     use super::*;
-    use std::{collections::HashMap, ffi::c_void, mem::size_of, path::Path};
+    use std::{
+        collections::HashMap,
+        ffi::c_void,
+        io::Read,
+        mem::size_of,
+        os::windows::process::CommandExt,
+        path::{Path, PathBuf},
+        process::Command,
+    };
     use windows_sys::Win32::{
         Foundation::{
             CloseHandle, ERROR_ACCESS_DENIED, ERROR_CALL_NOT_IMPLEMENTED, ERROR_INVALID_FUNCTION,
@@ -397,6 +636,197 @@ mod platform {
 
     const ERROR_BAD_LENGTH_CODE: u32 = 24;
     const ERROR_NO_MORE_FILES_CODE: u32 = 18;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+    #[derive(Deserialize)]
+    #[serde(rename_all = "PascalCase")]
+    struct CimProcess {
+        process_id: u32,
+        executable_path: Option<String>,
+        command_line: Option<String>,
+    }
+
+    struct CimFailure {
+        state: EvidenceState,
+        message: &'static str,
+    }
+
+    fn query_cim_processes(filter: &str) -> Result<Vec<CimProcess>, CimFailure> {
+        // These filters are constructed only from numeric PIDs or fixed Java
+        // executable names. The raw command lines stay in this local result
+        // until a launch target is parsed; they are never exported.
+        let script = format!(
+            "$ErrorActionPreference='Stop'; [Console]::OutputEncoding=[System.Text.UTF8Encoding]::new($false); $rows=@(Get-CimInstance -ClassName Win32_Process -Filter \"{filter}\" -Property ProcessId,ExecutablePath,CommandLine | Select-Object ProcessId,ExecutablePath,CommandLine); ConvertTo-Json -InputObject $rows -Compress"
+        );
+        let root = std::env::var_os("SystemRoot").ok_or(CimFailure {
+            state: EvidenceState::Unavailable,
+            message: "Windows system directory is unavailable for CIM query",
+        })?;
+        let powershell = PathBuf::from(root)
+            .join("System32")
+            .join("WindowsPowerShell")
+            .join("v1.0")
+            .join("powershell.exe");
+        let output = Command::new(powershell)
+            .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+            .creation_flags(CREATE_NO_WINDOW)
+            .output()
+            .map_err(|_| CimFailure {
+                state: EvidenceState::Unavailable,
+                message: "Windows PowerShell could not start for CIM query",
+            })?;
+        if !output.status.success() {
+            let denied = String::from_utf8_lossy(&output.stderr)
+                .to_ascii_lowercase()
+                .contains("access is denied");
+            return Err(CimFailure {
+                state: if denied {
+                    EvidenceState::AccessDenied
+                } else {
+                    EvidenceState::Unavailable
+                },
+                message: "Win32_Process command-line query failed",
+            });
+        }
+        serde_json::from_slice(&output.stdout).map_err(|_| CimFailure {
+            state: EvidenceState::Error,
+            message: "Win32_Process returned an unreadable command-line response",
+        })
+    }
+
+    fn jpackage_image_target(path: &str) -> Option<(JavaLaunchKind, Option<String>)> {
+        let launcher = Path::new(path);
+        if !launcher
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("exe"))
+        {
+            return None;
+        }
+        let parent = launcher.parent()?;
+        let stem = launcher.file_stem()?.to_str()?;
+        let cfg = parent.join("app").join(format!("{stem}.cfg"));
+        let jvm = parent
+            .join("runtime")
+            .join("bin")
+            .join("server")
+            .join("jvm.dll");
+        if !jvm.is_file() || !cfg.is_file() {
+            return None;
+        }
+        // A generated jpackage launcher config is small. A bound avoids
+        // consuming unbounded data from an unrelated or replaced file.
+        let mut contents = String::new();
+        std::fs::File::open(cfg)
+            .ok()?
+            .take(64 * 1024 + 1)
+            .read_to_string(&mut contents)
+            .ok()?;
+        if contents.len() > 64 * 1024 {
+            return None;
+        }
+        Some(parse_jpackage_config(&contents))
+    }
+
+    fn java_identity(
+        executable_path: &Evidence<String>,
+        modules: Option<&Evidence<ModuleInventory>>,
+        cim: Result<Option<&CimProcess>, &CimFailure>,
+    ) -> Option<Evidence<JavaAppIdentity>> {
+        let launcher_path = executable_path
+            .value
+            .as_deref()
+            .is_some_and(is_java_runtime_path);
+        let loaded_jvm = modules.is_some_and(has_jvm_module);
+        let packaged = executable_path
+            .value
+            .as_deref()
+            .and_then(jpackage_image_target);
+        if !launcher_path && !loaded_jvm && packaged.is_none() {
+            return None;
+        }
+        let identity_basis = if loaded_jvm && packaged.is_some() {
+            "Loaded jvm.dll module and jpackage launcher config"
+        } else if loaded_jvm {
+            "Loaded jvm.dll module"
+        } else if packaged.is_some() {
+            "jpackage launcher config and bundled runtime image"
+        } else {
+            "Java runtime launcher path"
+        };
+        let (command_line_state, command_line_message, launch_kind, launch_target) = match cim {
+            Err(error) => (
+                error.state,
+                Some(error.message.to_owned()),
+                JavaLaunchKind::Unknown,
+                None,
+            ),
+            Ok(None) => (
+                EvidenceState::Unavailable,
+                Some("PID was not found by Win32_Process during command-line query".to_owned()),
+                JavaLaunchKind::Unknown,
+                None,
+            ),
+            Ok(Some(process)) => {
+                let same_image = executable_path.value.as_deref().is_some_and(|path| {
+                    process
+                        .executable_path
+                        .as_deref()
+                        .is_some_and(|cim_path| path.eq_ignore_ascii_case(cim_path))
+                });
+                if !same_image {
+                    (
+                        EvidenceState::Unavailable,
+                        Some(
+                            "Process image changed or could not be matched during CIM query"
+                                .to_owned(),
+                        ),
+                        JavaLaunchKind::Unknown,
+                        None,
+                    )
+                } else if let Some(command_line) = process.command_line.as_deref() {
+                    let (kind, target) = if let Some((kind, target)) = packaged.as_ref() {
+                        (*kind, target.clone())
+                    } else if launcher_path {
+                        parse_java_launch_target(command_line)
+                    } else {
+                        // A custom jpackage launcher passes its own arguments;
+                        // a bare token cannot safely be called a Java main class.
+                        (JavaLaunchKind::Unknown, None)
+                    };
+                    (
+                        EvidenceState::Available,
+                        if target.is_none() {
+                            Some("The Java launch target could not be inferred from the command line".to_owned())
+                        } else {
+                            None
+                        },
+                        kind,
+                        target,
+                    )
+                } else {
+                    (
+                        EvidenceState::Unavailable,
+                        Some("Win32_Process did not expose the command line".to_owned()),
+                        JavaLaunchKind::Unknown,
+                        None,
+                    )
+                }
+            }
+        };
+        let (launch_kind, launch_target) = if launch_target.is_none() {
+            packaged.unwrap_or((launch_kind, launch_target))
+        } else {
+            (launch_kind, launch_target)
+        };
+        Some(Evidence::available(JavaAppIdentity {
+            launch_kind,
+            launch_target,
+            identity_basis: identity_basis.to_owned(),
+            runtime_confirmed: loaded_jvm,
+            command_line_state,
+            command_line_message,
+        }))
+    }
 
     struct OwnedHandle(HANDLE);
 
@@ -646,9 +1076,44 @@ mod platform {
                     executable_name: entry.name,
                     executable_path: query_image_path(entry.pid),
                     windows,
+                    java_app: None,
                 }
             })
             .collect();
+
+        let cim = processes
+            .iter()
+            .any(|process| is_java_launcher_name(&process.executable_name))
+            .then(|| query_cim_processes("Name = 'java.exe' OR Name = 'javaw.exe'"));
+        for process in &mut processes {
+            let is_named_launcher = is_java_launcher_name(&process.executable_name);
+            let runtime_path = process
+                .executable_path
+                .value
+                .as_deref()
+                .is_some_and(is_java_runtime_path);
+            let packaged = process
+                .executable_path
+                .value
+                .as_deref()
+                .and_then(jpackage_image_target)
+                .is_some();
+            if !is_named_launcher && !packaged {
+                continue;
+            }
+            let modules = if is_named_launcher && !runtime_path && !packaged {
+                Some(query_modules(process.pid))
+            } else {
+                None
+            };
+            let row = match &cim {
+                Some(result) if is_named_launcher => result
+                    .as_ref()
+                    .map(|rows| rows.iter().find(|row| row.process_id == process.pid)),
+                _ => Ok(None),
+            };
+            process.java_app = java_identity(&process.executable_path, modules.as_ref(), row);
+        }
 
         processes.sort_by(|left, right| {
             let left_visible = left
@@ -1181,12 +1646,34 @@ mod platform {
         let executable_name = process_name(pid, &executable_path);
         let windows = query_windows(pid);
         let modules = query_modules(pid);
+        let java_app = if executable_path
+            .value
+            .as_deref()
+            .is_some_and(is_java_runtime_path)
+            || has_jvm_module(&modules)
+            || executable_path
+                .value
+                .as_deref()
+                .and_then(jpackage_image_target)
+                .is_some()
+        {
+            let cim = query_cim_processes(&format!("ProcessId = {pid}"));
+            java_identity(
+                &executable_path,
+                Some(&modules),
+                cim.as_ref()
+                    .map(|rows| rows.iter().find(|row| row.process_id == pid)),
+            )
+        } else {
+            None
+        };
 
         match open_process(PROCESS_QUERY_INFORMATION, pid) {
             Ok(process) => ProcessInspection {
                 pid,
                 executable_name,
                 executable_path,
+                java_app,
                 mitigations: query_mitigations(process.raw()),
                 protection_level: query_protection_level(process.raw()),
                 remote_debugger_present: query_debugger(process.raw()),
@@ -1198,6 +1685,7 @@ mod platform {
                 pid,
                 executable_name,
                 executable_path,
+                java_app,
                 mitigations: failed_mitigations(error, "OpenProcess(PROCESS_QUERY_INFORMATION)"),
                 protection_level: error.evidence("OpenProcess for protection level"),
                 remote_debugger_present: error.evidence("OpenProcess for debugger query"),
@@ -1224,6 +1712,7 @@ mod platform {
             pid,
             executable_name: Evidence::unavailable(MESSAGE),
             executable_path: Evidence::unavailable(MESSAGE),
+            java_app: None,
             mitigations: MitigationPosture::unavailable(MESSAGE),
             protection_level: Evidence::unavailable(MESSAGE),
             remote_debugger_present: Evidence::unavailable(MESSAGE),
@@ -1237,6 +1726,46 @@ mod platform {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn java_launcher_extracts_only_jar_target_from_quoted_command_line() {
+        let command_line = r#""C:\Program Files\Java\bin\javaw.exe" -Xmx1g -jar "C:\Apps\My Tool\client.jar" --password secret-value"#;
+        let (kind, target) = parse_java_launch_target(command_line);
+        assert_eq!(kind, JavaLaunchKind::Jar);
+        assert_eq!(target.as_deref(), Some(r"C:\Apps\My Tool\client.jar"));
+        assert!(!format!("{target:?}").contains("secret-value"));
+    }
+
+    #[test]
+    fn java_launcher_skips_classpath_and_module_options() {
+        let (kind, target) = parse_java_launch_target(
+            r#"java.exe -Dmode=test -cp "C:\libs\first.jar;C:\libs\second.jar" com.example.Main --token secret"#,
+        );
+        assert_eq!(kind, JavaLaunchKind::MainClass);
+        assert_eq!(target.as_deref(), Some("com.example.Main"));
+        let (kind, target) = parse_java_launch_target(
+            r#"java.exe --module-path "C:\module jars" -m example.module/com.example.Main private-arg"#,
+        );
+        assert_eq!(kind, JavaLaunchKind::Module);
+        assert_eq!(target.as_deref(), Some("example.module/com.example.Main"));
+    }
+
+    #[test]
+    fn java_argument_file_does_not_guess_a_later_target() {
+        let (kind, target) =
+            parse_java_launch_target("java.exe @C:\\config\\launch.args secret-argument");
+        assert_eq!(kind, JavaLaunchKind::Unknown);
+        assert_eq!(target, None);
+    }
+
+    #[test]
+    fn jpackage_config_uses_application_target_only() {
+        let config = "[Application]\napp.runtime=$ROOTDIR\\runtime\napp.mainclass=com.example.Main\napp.classpath=$APPDIR\\app.jar\n\n[ArgOptions]\narguments=secret-argument\n";
+        let (kind, target) = parse_jpackage_config(config);
+        assert_eq!(kind, JavaLaunchKind::MainClass);
+        assert_eq!(target.as_deref(), Some("com.example.Main"));
+        assert!(!format!("{target:?}").contains("secret-argument"));
+    }
 
     #[test]
     fn aslr_does_not_treat_disallow_stripped_images_as_randomization() {

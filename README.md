@@ -1,7 +1,8 @@
-# OroResea 0.3.0
+# OroResea 0.4.0
 
 OroResea is a local, read-only Windows desktop analyzer for capture-protection
-evidence and process protection posture. It separates what a PE file declares
+evidence and process protection posture. It scans Windows PE files and Java
+artifacts, including JRE-based applications. It separates what a file contains
 before launch from what Windows reports for a running process; neither view is
 presented as proof that an application is impossible to capture or inject.
 
@@ -9,9 +10,9 @@ presented as proof that an application is impossible to capture or inject.
 
 ### Static capability scan
 
-Point OroResea at one Windows executable or DLL, or scan a directory tree. The
-scanner has three independently selectable categories and never launches or
-modifies the inspected files:
+Point OroResea at one Windows executable, DLL, Java archive or class file, or
+scan a directory tree. The scanner has four independently selectable categories
+and never launches or modifies the inspected files:
 
 - **WDA APIs and markers:** direct and delay-loaded imports, probable dynamic
   bindings, API strings, named WDA modes, and display-affinity inspection.
@@ -19,14 +20,29 @@ modifies the inspected files:
   `GetProcessMitigationPolicy`, and supporting signature-policy markers.
 - **DLL search / loading APIs:** `SetDefaultDllDirectories`,
   `SetDllDirectoryW`, `AddDllDirectory`, and `LoadLibrary` variants.
+- **Java bytecode / JNI:** class constant-pool references to WDA and mitigation
+  names, Java native-method and JNA/JNI/foreign-function indicators, and
+  bundled Windows native binaries. Supported inputs are `.jar`, `.war`,
+  `.ear`, `.jmod`, and loose `.class` files.
 
-Every result also records PE architecture, SHA-256, and embedded
-certificate-table presence. CIG and DLL findings are reported as capabilities;
-static API presence does not prove a policy was requested or accepted.
+Every result records its file type, size, and SHA-256. PE results also record
+architecture and embedded certificate-table presence. The PE certificate field
+does not evaluate Java archive signing. CIG, DLL, and Java findings are
+reported as capabilities; static references do not prove a policy was requested
+or accepted.
+
+Archive scanning is bounded to 20,000 entries, 16 MiB per entry, 128 MiB of
+total decompressed data, and two levels of nested JARs. If a limit or an
+unsupported archive entry prevents a complete scan, the result carries a
+partial-scan warning. A Java archive can contain unused classes or native
+libraries, and reflection or external dependencies can hide behavior from a
+static scan.
 
 Static evidence is not proof of runtime behavior. An application can import
 `SetWindowDisplayAffinity` only to clear protection with `WDA_NONE`, while
 packed, encrypted, downloaded, or generated code may hide a protection call.
+For JRE applications, Windows WDA and mitigation policies belong to the JVM
+process and its windows, not to a JAR in isolation.
 
 ### Protection Posture
 
@@ -44,6 +60,16 @@ Protection Posture has two complementary targets:
   policy, CFG/XFG, signature/Code Integrity Guard policy, image-load policy,
   user shadow stacks, process protection/PPL, debugger state, loaded-module
   metadata, and private executable or read-write-execute memory-region counts.
+
+For a running JRE application, select the host `java.exe` or `javaw.exe` PID in
+the process list. OroResea records a best-effort launch kind and target (JAR,
+module, main class, or source file) when available, without retaining unrelated
+command-line arguments. The live assessment measures the host process's Windows
+controls. A custom native launcher can still be assessed by PID; a loaded
+`jvm.dll` or jpackage layout may identify it, though its launch target can be
+unavailable. Use the static capability scan for JARs and
+`.class` files; the pre-launch Protection Posture file assessment remains
+PE-specific.
 
 The process list can include all processes or be limited to processes with
 visible top-level windows. Names are only labels; select the target by the
@@ -101,9 +127,10 @@ distinct from **Disabled** or **Fail** so missing evidence is not misreported.
 
 ## Reports
 
-Both WDA scans and Protection Posture assessments can be exported as JSON, CSV,
-or a self-contained HTML report. Protection Posture reports keep static, live,
-and system-scope findings separate and include the assessment limitations.
+Both static capability scans and Protection Posture assessments can be exported
+as JSON, CSV, or a self-contained HTML report. Protection Posture reports keep
+static, live, and system-scope findings separate and include the assessment
+limitations.
 
 ## Build and run
 
@@ -126,12 +153,17 @@ cargo build --release --locked --target x86_64-pc-windows-msvc
 
 The x64 executable is written to
 `target\x86_64-pc-windows-msvc\release\ororesea.exe`.
+Build ARM64 with `cargo build --release --locked --target aarch64-pc-windows-msvc`.
+After building a target, create its checked installer package with
+`./packaging/Build-Release.ps1 -Architecture x64` or
+`./packaging/Build-Release.ps1 -Architecture arm64`.
 
 ## Install a packaged release
 
-Download and extract `OroResea-v0.3.0-x64.zip` from the GitHub release, then
-double-click `install.cmd`. The installer verifies `OroResea.exe` against the
-included SHA-256 manifest, installs it for the current user under
+Download and extract `OroResea-v0.4.0-x64.zip` (or the ARM64 package) from the
+GitHub release, then double-click `install.cmd`. The installer verifies
+`OroResea.exe` against the included SHA-256 manifest and installs it for the
+current user under
 `%LOCALAPPDATA%\Programs\OroResea`, and creates a Start Menu shortcut. It does
 not require administrator access.
 
@@ -145,14 +177,16 @@ run:
 ## Use
 
 1. Start OroResea and choose **Static Capabilities** or **Protection Posture**.
-2. For a pre-launch assessment, choose an executable or DLL and analyze the
-   file. OroResea does not start it.
-3. For a live assessment, refresh the process list, select the intended PID,
+2. For a Java archive or class file, choose **Static Capabilities**, select the
+   artifact, and enable **Java bytecode / JNI**. OroResea does not start it.
+3. For a pre-launch PE assessment, choose an executable or DLL under
+   **Protection Posture** and analyze the file.
+4. For a live assessment, refresh the process list, select the intended PID,
    and take a snapshot. Repeat after a state change when current evidence is
    important.
-4. For OroNimbus, select **OroNimbus lab**, choose the expected WDA/CIG launch
+5. For OroNimbus, select **OroNimbus lab**, choose the expected WDA/CIG launch
    configuration, select the visible-window owner PID, and snapshot it.
-5. Review unavailable evidence and the limitations before drawing a conclusion,
+6. Review unavailable evidence and the limitations before drawing a conclusion,
    then export JSON, CSV, or HTML when a report is needed.
 
 ## Safety boundary
@@ -171,6 +205,9 @@ transmit a scan or snapshot automatically.
 
 - Static metadata describes declared capability and build configuration, not
   every runtime code path or effective policy.
+- Java class and archive references do not show whether classes are loaded,
+  native libraries are used, or an API call succeeds. Reflection, external
+  class paths, JIT compilation, and JNI calls can require runtime evidence.
 - A live assessment is a point-in-time snapshot. Process, window, module, and
   memory state can change immediately after collection.
 - Access-denied and unavailable results are gaps in observation, not evidence

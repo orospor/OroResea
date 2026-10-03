@@ -2,7 +2,9 @@ use crate::model::{Evidence, EvidenceKind, RiskLevel, ScanResult};
 use goblin::Object;
 use sha2::{Digest, Sha256};
 use std::{
+    collections::BTreeSet,
     fs,
+    io::{Cursor, Read},
     path::{Path, PathBuf},
     sync::{
         Arc,
@@ -13,15 +15,23 @@ use std::{
     time::{Duration, Instant},
 };
 use walkdir::WalkDir;
+use zip::ZipArchive;
 
 const MAX_FILE_SIZE: u64 = 512 * 1024 * 1024;
-const TARGET_EXTENSIONS: &[&str] = &["exe", "dll", "node", "ocx", "cpl", "scr", "sys"];
+const PE_EXTENSIONS: &[&str] = &["exe", "dll", "node", "ocx", "cpl", "scr", "sys"];
+const JAVA_EXTENSIONS: &[&str] = &["jar", "war", "ear", "jmod", "class"];
+const MAX_ARCHIVE_ENTRIES: usize = 20_000;
+const MAX_ARCHIVE_DEPTH: usize = 2;
+const MAX_ENTRY_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_EXPANDED_BYTES: u64 = 128 * 1024 * 1024;
+const MAX_DETAILED_FINDINGS: usize = 64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ScanOptions {
     pub wda: bool,
     pub process_mitigations: bool,
     pub dll_loading: bool,
+    pub java: bool,
 }
 
 impl Default for ScanOptions {
@@ -30,6 +40,7 @@ impl Default for ScanOptions {
             wda: true,
             process_mitigations: true,
             dll_loading: true,
+            java: true,
         }
     }
 }
@@ -72,7 +83,7 @@ pub fn spawn_scan_with_options(
 
 fn run_scan(root: PathBuf, tx: Sender<ScanMessage>, cancel: Arc<AtomicBool>, options: ScanOptions) {
     let started = Instant::now();
-    let candidates = collect_candidates(&root);
+    let candidates = collect_candidates(&root, options);
     let total = candidates.len();
     if tx.send(ScanMessage::Started { total }).is_err() {
         return;
@@ -111,7 +122,7 @@ fn run_scan(root: PathBuf, tx: Sender<ScanMessage>, cancel: Arc<AtomicBool>, opt
     });
 }
 
-fn collect_candidates(root: &Path) -> Vec<PathBuf> {
+fn collect_candidates(root: &Path, options: ScanOptions) -> Vec<PathBuf> {
     if root.is_file() {
         return vec![root.to_owned()];
     }
@@ -122,17 +133,21 @@ fn collect_candidates(root: &Path) -> Vec<PathBuf> {
         .filter_map(Result::ok)
         .filter(|entry| entry.file_type().is_file())
         .map(|entry| entry.into_path())
-        .filter(|path| is_candidate(path))
+        .filter(|path| is_candidate(path, options))
         .collect();
 
     paths.sort_by_cached_key(|path| path.to_string_lossy().to_ascii_lowercase());
     paths
 }
 
-fn is_candidate(path: &Path) -> bool {
+fn is_candidate(path: &Path, options: ScanOptions) -> bool {
     path.extension()
         .and_then(|ext| ext.to_str())
-        .map(|ext| TARGET_EXTENSIONS.contains(&ext.to_ascii_lowercase().as_str()))
+        .map(|ext| {
+            let ext = ext.to_ascii_lowercase();
+            PE_EXTENSIONS.contains(&ext.as_str())
+                || (options.java && JAVA_EXTENSIONS.contains(&ext.as_str()))
+        })
         .unwrap_or(false)
 }
 
@@ -146,6 +161,21 @@ pub fn analyze_file_with_options(path: &Path, options: ScanOptions) -> ScanResul
         Ok(metadata) => metadata,
         Err(error) => return ScanResult::failed(path.to_owned(), error.to_string()),
     };
+
+    let extension = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if options.java && extension == "class" && metadata.len() > MAX_ENTRY_BYTES {
+        return ScanResult::failed(
+            path.to_owned(),
+            format!(
+                "Java class is larger than the {} MiB inspection limit",
+                MAX_ENTRY_BYTES / 1024 / 1024
+            ),
+        );
+    }
 
     if metadata.len() > MAX_FILE_SIZE {
         return ScanResult::failed(
@@ -168,6 +198,28 @@ pub fn analyze_file_with_options(path: &Path, options: ScanOptions) -> ScanResul
         .and_then(|name| name.to_str())
         .unwrap_or("Unknown file")
         .to_owned();
+
+    if JAVA_EXTENSIONS.contains(&extension.as_str()) && !options.java {
+        return ScanResult {
+            path: path.to_owned(),
+            file_name,
+            file_kind: "Java file (scan disabled)".to_owned(),
+            architecture: "Unknown".to_owned(),
+            size_bytes: metadata.len(),
+            sha256,
+            embedded_signature: false,
+            highest_level: RiskLevel::Error,
+            findings: Vec::new(),
+            relevant_imports: Vec::new(),
+            error: Some("Java analysis is disabled by the current scan option".to_owned()),
+        };
+    }
+    if extension == "class" {
+        return analyze_java_class(path, &file_name, metadata.len(), sha256, &bytes, options);
+    }
+    if matches!(extension.as_str(), "jar" | "war" | "ear" | "jmod") {
+        return analyze_java_archive(path, &file_name, metadata.len(), sha256, &bytes, options);
+    }
 
     let pe = match Object::parse(&bytes) {
         Ok(Object::PE(pe)) => pe,
@@ -242,6 +294,495 @@ pub fn analyze_file_with_options(path: &Path, options: ScanOptions) -> ScanResul
         relevant_imports,
         error: None,
     }
+}
+
+#[derive(Default)]
+struct JavaScan {
+    classes: usize,
+    bridge_classes: usize,
+    native_images: usize,
+    architectures: BTreeSet<String>,
+    findings: Vec<Evidence>,
+    relevant_imports: Vec<String>,
+    expanded_bytes: u64,
+    entries_seen: usize,
+    skipped_large: usize,
+    skipped_depth: usize,
+    skipped_invalid: usize,
+    skipped_unsupported: usize,
+    skipped_budget: usize,
+    dropped_findings: usize,
+}
+
+impl JavaScan {
+    fn push(&mut self, finding: Evidence) {
+        if self.findings.len() < MAX_DETAILED_FINDINGS {
+            self.findings.push(finding);
+        } else {
+            self.dropped_findings += 1;
+        }
+    }
+
+    fn finish(
+        mut self,
+        path: &Path,
+        file_name: &str,
+        file_kind: String,
+        size_bytes: u64,
+        sha256: String,
+    ) -> ScanResult {
+        self.findings.push(Evidence {
+            kind: EvidenceKind::JavaBytecode,
+            level: RiskLevel::Informational,
+            confidence: 95,
+            title: "Java bytecode inventory".to_owned(),
+            detail: format!(
+                "Inspected {} class file(s), {} class(es) with a native bridge marker, and {} embedded Windows PE image(s). This inventory does not prove that any method executed.",
+                self.classes, self.bridge_classes, self.native_images
+            ),
+        });
+        let skipped = self.skipped_large
+            + self.skipped_depth
+            + self.skipped_invalid
+            + self.skipped_unsupported
+            + self.skipped_budget;
+        if skipped > 0 || self.dropped_findings > 0 {
+            self.findings.push(Evidence {
+                kind: EvidenceKind::JavaBytecode,
+                level: RiskLevel::Informational,
+                confidence: 95,
+                title: "Java archive inspection incomplete".to_owned(),
+                detail: format!(
+                    "Skipped entries: oversized {}, nesting limit {}, malformed {}, unsupported ZIP compression/read {}, scan budget {}; omitted {} detailed finding(s). Limits: {} entries, {} MiB per entry, {} MiB expanded total, nested depth {}.",
+                    self.skipped_large,
+                    self.skipped_depth,
+                    self.skipped_invalid,
+                    self.skipped_unsupported,
+                    self.skipped_budget,
+                    self.dropped_findings,
+                    MAX_ARCHIVE_ENTRIES,
+                    MAX_ENTRY_BYTES / 1024 / 1024,
+                    MAX_EXPANDED_BYTES / 1024 / 1024,
+                    MAX_ARCHIVE_DEPTH,
+                ),
+            });
+        }
+        self.findings
+            .sort_by_key(|finding| std::cmp::Reverse(finding.level.rank()));
+        let highest_level = self
+            .findings
+            .iter()
+            .map(|finding| finding.level)
+            .max_by_key(|level| level.rank())
+            .unwrap_or(RiskLevel::Clean);
+        let architecture = if self.architectures.is_empty() && self.classes > 0 {
+            "JVM bytecode".to_owned()
+        } else if self.architectures.is_empty() {
+            "Unknown".to_owned()
+        } else if self.classes == 0 {
+            self.architectures
+                .into_iter()
+                .collect::<Vec<_>>()
+                .join(", ")
+        } else {
+            format!(
+                "JVM bytecode + {}",
+                self.architectures
+                    .into_iter()
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        };
+        ScanResult {
+            path: path.to_owned(),
+            file_name: file_name.to_owned(),
+            file_kind,
+            architecture,
+            size_bytes,
+            sha256,
+            embedded_signature: false,
+            highest_level,
+            findings: self.findings,
+            relevant_imports: self.relevant_imports,
+            error: None,
+        }
+    }
+}
+
+fn analyze_java_class(
+    path: &Path,
+    file_name: &str,
+    size_bytes: u64,
+    sha256: String,
+    bytes: &[u8],
+    options: ScanOptions,
+) -> ScanResult {
+    let mut scan = JavaScan::default();
+    if !inspect_class(bytes, file_name, options, &mut scan) {
+        return ScanResult::failed(path.to_owned(), "Invalid Java class file");
+    }
+    scan.finish(path, file_name, "Java class".to_owned(), size_bytes, sha256)
+}
+
+fn analyze_java_archive(
+    path: &Path,
+    file_name: &str,
+    size_bytes: u64,
+    sha256: String,
+    bytes: &[u8],
+    options: ScanOptions,
+) -> ScanResult {
+    let extension = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or("jar")
+        .to_ascii_lowercase();
+    let mut scan = JavaScan::default();
+    if let Err(error) = inspect_archive(bytes, &extension, 0, "", options, &mut scan) {
+        return ScanResult::failed(
+            path.to_owned(),
+            format!("Java archive parsing failed: {error}"),
+        );
+    }
+    scan.finish(
+        path,
+        file_name,
+        format!("Java archive ({})", extension.to_ascii_uppercase()),
+        size_bytes,
+        sha256,
+    )
+}
+
+fn inspect_archive(
+    bytes: &[u8],
+    extension: &str,
+    depth: usize,
+    prefix: &str,
+    options: ScanOptions,
+    scan: &mut JavaScan,
+) -> Result<(), String> {
+    // A JMOD has a four-byte header before the ZIP payload.
+    let zip_bytes = if extension == "jmod" && bytes.starts_with(b"JM\x01\x00") {
+        &bytes[4..]
+    } else {
+        bytes
+    };
+    let mut archive = ZipArchive::new(Cursor::new(zip_bytes)).map_err(|error| error.to_string())?;
+    let entry_count = archive.len();
+    for index in 0..entry_count {
+        if scan.entries_seen >= MAX_ARCHIVE_ENTRIES {
+            scan.skipped_budget += entry_count - index;
+            break;
+        }
+        scan.entries_seen += 1;
+        let mut entry = match archive.by_index(index) {
+            Ok(entry) => entry,
+            Err(_) => {
+                scan.skipped_unsupported += 1;
+                continue;
+            }
+        };
+        if entry.is_dir() {
+            continue;
+        }
+        let name = entry.name().to_owned();
+        let member_extension = Path::new(&name)
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        let is_class = member_extension == "class";
+        let is_native = PE_EXTENSIONS.contains(&member_extension.as_str());
+        let is_nested = matches!(member_extension.as_str(), "jar" | "war" | "ear" | "jmod");
+        if !(is_class || is_native || is_nested) {
+            continue;
+        }
+        if is_nested && depth >= MAX_ARCHIVE_DEPTH {
+            scan.skipped_depth += 1;
+            continue;
+        }
+        if entry.size() > MAX_ENTRY_BYTES {
+            scan.skipped_large += 1;
+            continue;
+        }
+        let remaining = MAX_EXPANDED_BYTES.saturating_sub(scan.expanded_bytes);
+        if remaining == 0 || entry.size() > remaining {
+            scan.skipped_budget += 1;
+            continue;
+        }
+        let allowed = MAX_ENTRY_BYTES.min(remaining);
+        let mut contents = Vec::with_capacity(entry.size().min(allowed) as usize);
+        match (&mut entry).take(allowed + 1).read_to_end(&mut contents) {
+            Ok(_) if contents.len() as u64 <= allowed => {}
+            Ok(_) => {
+                scan.skipped_large += 1;
+                continue;
+            }
+            Err(_) => {
+                scan.skipped_unsupported += 1;
+                continue;
+            }
+        }
+        scan.expanded_bytes += contents.len() as u64;
+        let display_name = safe_member_name(&format!("{prefix}{name}"));
+        if is_class {
+            if !inspect_class(&contents, &display_name, options, scan) {
+                scan.skipped_invalid += 1;
+            }
+        } else if is_native {
+            inspect_native_member(&contents, &display_name, options, scan);
+        } else if inspect_archive(
+            &contents,
+            &member_extension,
+            depth + 1,
+            &format!("{display_name}!/"),
+            options,
+            scan,
+        )
+        .is_err()
+        {
+            scan.skipped_invalid += 1;
+        }
+    }
+    Ok(())
+}
+
+fn safe_member_name(name: &str) -> String {
+    name.chars()
+        .take(240)
+        .map(|character| {
+            if character.is_control() {
+                '?'
+            } else {
+                character
+            }
+        })
+        .collect()
+}
+
+fn inspect_native_member(bytes: &[u8], member: &str, options: ScanOptions, scan: &mut JavaScan) {
+    let Ok(Object::PE(pe)) = Object::parse(bytes) else {
+        return;
+    };
+    scan.native_images += 1;
+    scan.architectures
+        .insert(architecture_name(pe.header.coff_header.machine).to_owned());
+    let mut imports: Vec<ParsedImport> = pe
+        .imports
+        .iter()
+        .map(|import| ParsedImport {
+            dll: import.dll.to_owned(),
+            name: import.name.to_string(),
+            delayed: false,
+        })
+        .collect();
+    imports.extend(parse_delay_imports(bytes, &pe));
+    let is_managed = contains_ascii_ci(bytes, b"mscoree.dll");
+    for mut finding in classify_evidence_with_options(&imports, bytes, is_managed, options) {
+        finding.detail = format!("Embedded PE {member}: {}", finding.detail);
+        scan.push(finding);
+    }
+    for import in imports
+        .iter()
+        .filter(|import| is_relevant_import(&import.name, options))
+    {
+        if scan.relevant_imports.len() >= 128 {
+            break;
+        }
+        scan.relevant_imports.push(format!(
+            "{member}: {}!{}{}",
+            import.dll,
+            import.name,
+            if import.delayed { " [delay]" } else { "" }
+        ));
+    }
+}
+
+#[derive(Default)]
+struct ClassSignals {
+    wda_api: bool,
+    wda_value: bool,
+    mitigation_api: bool,
+    signature_policy: bool,
+    native_bridge: bool,
+}
+
+fn inspect_class(bytes: &[u8], member: &str, options: ScanOptions, scan: &mut JavaScan) -> bool {
+    let Some(signals) = class_signals(bytes) else {
+        return false;
+    };
+    scan.classes += 1;
+    if signals.native_bridge {
+        scan.bridge_classes += 1;
+    }
+    if options.wda && signals.wda_api {
+        scan.push(Evidence {
+            kind: if signals.native_bridge {
+                EvidenceKind::JavaNativeBridge
+            } else {
+                EvidenceKind::JavaBytecode
+            },
+            level: if signals.native_bridge {
+                RiskLevel::Medium
+            } else {
+                RiskLevel::Low
+            },
+            confidence: if signals.native_bridge { 70 } else { 45 },
+            title: if signals.native_bridge {
+                "Java/native WDA binding reference".to_owned()
+            } else {
+                "WDA API name in Java bytecode".to_owned()
+            },
+            detail: format!(
+                "Class {member} references SetWindowDisplayAffinity{}{}. Static bytecode cannot prove the call executes, which affinity value is used, or whether Windows accepted it.",
+                if signals.native_bridge {
+                    " and a JNA/JNI/foreign-function bridge marker"
+                } else {
+                    ""
+                },
+                if signals.wda_value {
+                    " plus a named WDA value"
+                } else {
+                    ""
+                }
+            ),
+        });
+    } else if options.wda && signals.wda_value {
+        scan.push(Evidence {
+            kind: EvidenceKind::JavaBytecode,
+            level: RiskLevel::Informational,
+            confidence: 40,
+            title: "WDA value name in Java bytecode".to_owned(),
+            detail: format!(
+                "Class {member} contains a WDA_EXCLUDEFROMCAPTURE or WDA_MONITOR name. A value name alone does not show a Windows API call."
+            ),
+        });
+    }
+    if options.process_mitigations && signals.mitigation_api && signals.signature_policy {
+        scan.push(Evidence {
+            kind: if signals.native_bridge {
+                EvidenceKind::JavaNativeBridge
+            } else {
+                EvidenceKind::JavaBytecode
+            },
+            level: RiskLevel::Informational,
+            confidence: if signals.native_bridge { 55 } else { 40 },
+            title: "Java process-signature policy reference".to_owned(),
+            detail: format!(
+                "Class {member} contains SetProcessMitigationPolicy and a signature-policy name. This is a static capability hint, not evidence that CIG is active in a JVM process."
+            ),
+        });
+    }
+    true
+}
+
+fn class_signals(bytes: &[u8]) -> Option<ClassSignals> {
+    if bytes.get(..4)? != b"\xca\xfe\xba\xbe" {
+        return None;
+    }
+    let mut offset = 8; // magic and major/minor version
+    let constant_count = next_u16_be(bytes, &mut offset)? as usize;
+    if constant_count == 0 {
+        return None;
+    }
+    let mut constants = Vec::new();
+    let mut index = 1;
+    while index < constant_count {
+        let tag = *take_bytes(bytes, &mut offset, 1)?.first()?;
+        match tag {
+            1 => {
+                let length = next_u16_be(bytes, &mut offset)? as usize;
+                constants.push(take_bytes(bytes, &mut offset, length)?);
+            }
+            3 | 4 | 9 | 10 | 11 | 12 | 17 | 18 => {
+                take_bytes(bytes, &mut offset, 4)?;
+            }
+            5 | 6 => {
+                take_bytes(bytes, &mut offset, 8)?;
+                index += 1;
+            }
+            7 | 8 | 16 | 19 | 20 => {
+                take_bytes(bytes, &mut offset, 2)?;
+            }
+            15 => {
+                take_bytes(bytes, &mut offset, 3)?;
+            }
+            _ => return None,
+        }
+        index += 1;
+    }
+    take_bytes(bytes, &mut offset, 6)?; // class access, this, super
+    let interfaces = next_u16_be(bytes, &mut offset)? as usize;
+    take_bytes(bytes, &mut offset, interfaces.checked_mul(2)?)?;
+    let fields = next_u16_be(bytes, &mut offset)?;
+    for _ in 0..fields {
+        take_bytes(bytes, &mut offset, 6)?;
+        let attributes = next_u16_be(bytes, &mut offset)?;
+        skip_attributes(bytes, &mut offset, attributes)?;
+    }
+    let methods = next_u16_be(bytes, &mut offset)?;
+    let mut native_methods = 0;
+    for _ in 0..methods {
+        let flags = next_u16_be(bytes, &mut offset)?;
+        if flags & 0x0100 != 0 {
+            native_methods += 1;
+        }
+        take_bytes(bytes, &mut offset, 4)?; // name and descriptor indices
+        let attributes = next_u16_be(bytes, &mut offset)?;
+        skip_attributes(bytes, &mut offset, attributes)?;
+    }
+    let attributes = next_u16_be(bytes, &mut offset)?;
+    skip_attributes(bytes, &mut offset, attributes)?;
+    if offset != bytes.len() {
+        return None;
+    }
+    let contains = |needle: &[u8]| {
+        constants
+            .iter()
+            .any(|constant| contains_ascii_ci(constant, needle))
+    };
+    let native_bridge = native_methods > 0
+        || (contains(b"java/lang/System") && (contains(b"loadLibrary") || contains(b"load")))
+        || contains(b"com/sun/jna/")
+        || contains(b"jnr/ffi/")
+        || contains(b"java/lang/foreign/")
+        || contains(b"jdk/incubator/foreign/")
+        || contains(b"org/bytedeco/javacpp/");
+    Some(ClassSignals {
+        wda_api: contains(b"SetWindowDisplayAffinity"),
+        wda_value: contains(b"WDA_EXCLUDEFROMCAPTURE") || contains(b"WDA_MONITOR"),
+        mitigation_api: contains(b"SetProcessMitigationPolicy"),
+        signature_policy: contains(b"ProcessSignaturePolicy") || contains(b"MicrosoftSignedOnly"),
+        native_bridge,
+    })
+}
+
+fn skip_attributes(bytes: &[u8], offset: &mut usize, count: u16) -> Option<()> {
+    for _ in 0..count {
+        take_bytes(bytes, offset, 2)?; // attribute name index
+        let length = next_u32_be(bytes, offset)? as usize;
+        take_bytes(bytes, offset, length)?;
+    }
+    Some(())
+}
+
+fn take_bytes<'a>(bytes: &'a [u8], offset: &mut usize, length: usize) -> Option<&'a [u8]> {
+    let end = offset.checked_add(length)?;
+    let slice = bytes.get(*offset..end)?;
+    *offset = end;
+    Some(slice)
+}
+
+fn next_u16_be(bytes: &[u8], offset: &mut usize) -> Option<u16> {
+    Some(u16::from_be_bytes(
+        take_bytes(bytes, offset, 2)?.try_into().ok()?,
+    ))
+}
+
+fn next_u32_be(bytes: &[u8], offset: &mut usize) -> Option<u32> {
+    Some(u32::from_be_bytes(
+        take_bytes(bytes, offset, 4)?.try_into().ok()?,
+    ))
 }
 
 #[cfg(test)]
@@ -719,6 +1260,215 @@ fn read_u64(bytes: &[u8], offset: usize) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
+    use zip::{ZipWriter, write::SimpleFileOptions};
+
+    fn test_class(constants: &[&str], native_method: bool) -> Vec<u8> {
+        fn utf8(value: &str) -> Vec<u8> {
+            let mut entry = vec![1];
+            entry.extend_from_slice(&(value.len() as u16).to_be_bytes());
+            entry.extend_from_slice(value.as_bytes());
+            entry
+        }
+        let mut entries = vec![
+            utf8("Fixture"),
+            vec![7, 0, 1],
+            utf8("java/lang/Object"),
+            vec![7, 0, 3],
+            utf8("nativeMethod"),
+            utf8("()V"),
+        ];
+        entries.extend(constants.iter().map(|value| utf8(value)));
+        let mut bytes = b"\xca\xfe\xba\xbe".to_vec();
+        bytes.extend_from_slice(&0u16.to_be_bytes());
+        bytes.extend_from_slice(&61u16.to_be_bytes());
+        bytes.extend_from_slice(&((entries.len() + 1) as u16).to_be_bytes());
+        for entry in entries {
+            bytes.extend_from_slice(&entry);
+        }
+        bytes.extend_from_slice(&0x0021u16.to_be_bytes()); // public/super
+        bytes.extend_from_slice(&2u16.to_be_bytes()); // this class
+        bytes.extend_from_slice(&4u16.to_be_bytes()); // superclass
+        bytes.extend_from_slice(&0u16.to_be_bytes()); // interfaces
+        bytes.extend_from_slice(&0u16.to_be_bytes()); // fields
+        bytes.extend_from_slice(&(native_method as u16).to_be_bytes()); // methods
+        if native_method {
+            bytes.extend_from_slice(&0x0101u16.to_be_bytes()); // public/native
+            bytes.extend_from_slice(&5u16.to_be_bytes()); // method name
+            bytes.extend_from_slice(&6u16.to_be_bytes()); // descriptor
+            bytes.extend_from_slice(&0u16.to_be_bytes()); // attributes
+        }
+        bytes.extend_from_slice(&0u16.to_be_bytes()); // class attributes
+        bytes
+    }
+
+    fn test_archive(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
+        for (name, contents) in entries {
+            writer
+                .start_file(*name, SimpleFileOptions::default())
+                .unwrap();
+            writer.write_all(contents).unwrap();
+        }
+        writer.finish().unwrap().into_inner()
+    }
+
+    #[test]
+    fn valid_java_class_reports_binding_without_claiming_runtime_enforcement() {
+        let bytes = test_class(&["SetWindowDisplayAffinity", "com/sun/jna/Library"], false);
+        let mut scan = JavaScan::default();
+        assert!(inspect_class(
+            &bytes,
+            "Fixture.class",
+            ScanOptions::default(),
+            &mut scan
+        ));
+        assert_eq!(scan.classes, 1);
+        assert_eq!(scan.bridge_classes, 1);
+        assert!(scan.findings.iter().any(|finding| {
+            finding.kind == EvidenceKind::JavaNativeBridge
+                && finding.level == RiskLevel::Medium
+                && finding.detail.contains("cannot prove the call executes")
+        }));
+    }
+
+    #[test]
+    fn jar_and_nested_jar_classes_are_inspected() {
+        let nested_class = test_class(&["SetWindowDisplayAffinity"], true);
+        let nested = test_archive(&[("Nested.class", &nested_class)]);
+        let outer_class = test_class(&["java/lang/foreign/Linker"], false);
+        let outer = test_archive(&[
+            ("BOOT-INF/classes/Outer.class", &outer_class),
+            ("BOOT-INF/lib/library.jar", &nested),
+        ]);
+        let mut scan = JavaScan::default();
+        inspect_archive(&outer, "jar", 0, "", ScanOptions::default(), &mut scan).unwrap();
+        assert_eq!(scan.classes, 2);
+        assert_eq!(scan.bridge_classes, 2);
+        assert!(scan.findings.iter().any(|finding| {
+            finding
+                .detail
+                .contains("BOOT-INF/lib/library.jar!/Nested.class")
+        }));
+    }
+
+    #[test]
+    fn jmod_header_is_removed_before_zip_parsing() {
+        let class = test_class(&[], false);
+        let zip = test_archive(&[("classes/Fixture.class", &class)]);
+        let mut jmod = b"JM\x01\x00".to_vec();
+        jmod.extend_from_slice(&zip);
+        let mut scan = JavaScan::default();
+        inspect_archive(&jmod, "jmod", 0, "", ScanOptions::default(), &mut scan).unwrap();
+        assert_eq!(scan.classes, 1);
+    }
+
+    #[test]
+    fn malformed_archive_returns_an_error() {
+        let path = Path::new("invalid.jar");
+        let result = analyze_java_archive(
+            path,
+            "invalid.jar",
+            7,
+            "abc".to_owned(),
+            b"not-zip",
+            ScanOptions::default(),
+        );
+        assert_eq!(result.highest_level, RiskLevel::Error);
+        assert!(result.error.unwrap().contains("archive parsing failed"));
+    }
+
+    #[test]
+    fn nested_archive_limit_is_visible_in_result() {
+        let class = test_class(&[], false);
+        let level_four = test_archive(&[("Fixture.class", &class)]);
+        let level_three = test_archive(&[("nested.jar", &level_four)]);
+        let level_two = test_archive(&[("nested.jar", &level_three)]);
+        let level_one = test_archive(&[("nested.jar", &level_two)]);
+        let mut scan = JavaScan::default();
+        inspect_archive(&level_one, "jar", 0, "", ScanOptions::default(), &mut scan).unwrap();
+        let result = scan.finish(
+            Path::new("outer.jar"),
+            "outer.jar",
+            "Java archive (JAR)".to_owned(),
+            level_one.len() as u64,
+            "abc".to_owned(),
+        );
+        assert!(
+            result
+                .findings
+                .iter()
+                .any(|finding| finding.title == "Java archive inspection incomplete")
+        );
+    }
+
+    #[test]
+    fn oversized_archive_member_produces_partial_scan_evidence() {
+        let oversized = vec![0u8; MAX_ENTRY_BYTES as usize + 1];
+        let archive = test_archive(&[("Large.class", &oversized)]);
+        let mut scan = JavaScan::default();
+        inspect_archive(&archive, "jar", 0, "", ScanOptions::default(), &mut scan).unwrap();
+        let result = scan.finish(
+            Path::new("large.jar"),
+            "large.jar",
+            "Java archive (JAR)".to_owned(),
+            archive.len() as u64,
+            "abc".to_owned(),
+        );
+        assert_eq!(scan_warning_count(&result), 1);
+        assert_eq!(result.architecture, "Unknown");
+    }
+
+    fn scan_warning_count(result: &ScanResult) -> usize {
+        result
+            .findings
+            .iter()
+            .filter(|finding| finding.title == "Java archive inspection incomplete")
+            .count()
+    }
+
+    #[test]
+    fn java_toggle_filters_folder_candidates() {
+        let disabled = ScanOptions {
+            java: false,
+            ..ScanOptions::default()
+        };
+        assert!(!is_candidate(Path::new("a.jar"), disabled));
+        assert!(!is_candidate(Path::new("a.class"), disabled));
+        assert!(is_candidate(Path::new("a.dll"), disabled));
+    }
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn jar_inspects_bundled_pe_imports() {
+        use std::process::Command;
+
+        let source = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("fixtures")
+            .join("wda_fixture.rs");
+        let output = std::env::temp_dir().join(format!(
+            "ororesea-java-native-fixture-{}.exe",
+            std::process::id()
+        ));
+        let status = Command::new("rustc")
+            .arg(&source)
+            .arg("-o")
+            .arg(&output)
+            .status()
+            .expect("rustc should compile the native fixture");
+        assert!(status.success());
+        let pe_bytes = fs::read(&output).unwrap();
+        let _ = fs::remove_file(&output);
+        assert!(pe_bytes.len() as u64 <= MAX_ENTRY_BYTES);
+        let jar = test_archive(&[("natives/wda.exe", &pe_bytes)]);
+        let mut scan = JavaScan::default();
+        inspect_archive(&jar, "jar", 0, "", ScanOptions::default(), &mut scan).unwrap();
+        assert_eq!(scan.native_images, 1);
+        assert!(scan.findings.iter().any(|finding| {
+            finding.kind == EvidenceKind::DirectImport && finding.detail.contains("natives/wda.exe")
+        }));
+    }
 
     #[test]
     fn direct_set_import_is_high_confidence() {
@@ -783,6 +1533,7 @@ mod tests {
                 wda: false,
                 process_mitigations: true,
                 dll_loading: false,
+                java: true,
             },
         );
         assert!(findings.iter().any(|finding| {
@@ -820,6 +1571,7 @@ mod tests {
                 wda: false,
                 process_mitigations: false,
                 dll_loading: true,
+                java: true,
             },
         );
         assert_eq!(findings.len(), 1);

@@ -48,6 +48,7 @@ pub struct OroReseaApp {
     scan_wda: bool,
     scan_process_mitigations: bool,
     scan_dll_loading: bool,
+    scan_java: bool,
     scan_rx: Option<Receiver<ScanMessage>>,
     cancel: Option<Arc<AtomicBool>>,
     scanning: bool,
@@ -82,6 +83,7 @@ impl OroReseaApp {
             scan_wda: true,
             scan_process_mitigations: true,
             scan_dll_loading: true,
+            scan_java: true,
             scan_rx: None,
             cancel: None,
             scanning: false,
@@ -89,7 +91,7 @@ impl OroReseaApp {
             progress_total: 0,
             current_file: String::new(),
             last_elapsed: None,
-            status: "Choose a Windows binary or a directory to begin.".to_owned(),
+            status: "Choose a Windows binary, Java artifact, or directory to begin.".to_owned(),
             posture_source_text: String::new(),
             posture_processes: Vec::new(),
             posture_selected_pid: None,
@@ -117,7 +119,11 @@ impl OroReseaApp {
             return;
         }
 
-        if !self.scan_wda && !self.scan_process_mitigations && !self.scan_dll_loading {
+        if !self.scan_wda
+            && !self.scan_process_mitigations
+            && !self.scan_dll_loading
+            && !self.scan_java
+        {
             self.status = "Select at least one static scan category.".to_owned();
             return;
         }
@@ -128,6 +134,7 @@ impl OroReseaApp {
                 wda: self.scan_wda,
                 process_mitigations: self.scan_process_mitigations,
                 dll_loading: self.scan_dll_loading,
+                java: self.scan_java,
             },
         );
         self.results.clear();
@@ -139,7 +146,7 @@ impl OroReseaApp {
         self.progress_total = 0;
         self.current_file.clear();
         self.last_elapsed = None;
-        self.status = "Discovering candidate PE files...".to_owned();
+        self.status = "Discovering candidate Windows and Java files...".to_owned();
     }
 
     fn cancel_scan(&mut self) {
@@ -162,7 +169,7 @@ impl OroReseaApp {
                 ScanMessage::Started { total } => {
                     self.progress_total = total;
                     self.status = if total == 0 {
-                        "No supported PE file extensions were found.".to_owned()
+                        "No supported Windows or Java file extensions were found.".to_owned()
                     } else {
                         format!("Found {total} candidate file(s).")
                     };
@@ -252,6 +259,11 @@ impl OroReseaApp {
                 "The selected path must be an existing Windows binary file.".to_owned();
             return;
         }
+        if is_java_path(&source) {
+            self.posture_status =
+                "Use Static Capabilities to analyze a JAR, Java archive, or class file.".to_owned();
+            return;
+        }
 
         self.posture_rx = Some(posture::spawn_file_assessment_with_profile(
             source.clone(),
@@ -312,14 +324,26 @@ impl OroReseaApp {
         if let Some(path) = dropped.first().map(|file| file.path().to_owned()) {
             match self.mode {
                 AppMode::WdaEvidence => {
+                    if is_java_path(&path) {
+                        self.scan_java = true;
+                    }
                     self.source_text = path.to_string_lossy().into_owned();
                     self.status = "Dropped target selected. Press Scan to analyze it.".to_owned();
                 }
                 AppMode::ProtectionPosture => {
-                    self.posture_source_text = path.to_string_lossy().into_owned();
-                    self.posture_status =
-                        "Dropped file selected. Press Analyze file for pre-launch checks."
-                            .to_owned();
+                    if is_java_path(&path) {
+                        self.mode = AppMode::WdaEvidence;
+                        self.scan_java = true;
+                        self.source_text = path.to_string_lossy().into_owned();
+                        self.status =
+                            "Java artifact selected. Press Scan for static capability evidence."
+                                .to_owned();
+                    } else {
+                        self.posture_source_text = path.to_string_lossy().into_owned();
+                        self.posture_status =
+                            "Dropped file selected. Press Analyze file for pre-launch checks."
+                                .to_owned();
+                    }
                 }
             }
         }
@@ -468,7 +492,7 @@ impl OroReseaApp {
                         ui.label(RichText::new("OroResea").size(22.0).strong().color(TEXT));
                         ui.label(
                             RichText::new(
-                                "Windows capture-protection capability and process-posture analyzer",
+                                "Windows and Java capture-protection capability and process-posture analyzer",
                             )
                                 .size(12.0)
                                 .color(MUTED),
@@ -560,16 +584,22 @@ impl OroReseaApp {
                     ui.add(
                         TextEdit::singleline(&mut self.source_text)
                             .desired_width(width)
-                            .hint_text("Drop or choose an EXE, DLL, or directory"),
+                            .hint_text("Drop or choose an EXE, DLL, JAR, class, or directory"),
                     );
                     if ui.button("File...").clicked()
                         && let Some(path) = FileDialog::new()
                             .add_filter(
-                                "Windows binaries",
-                                &["exe", "dll", "node", "ocx", "cpl", "scr", "sys"],
+                                "Windows and Java artifacts",
+                                &[
+                                    "exe", "dll", "node", "ocx", "cpl", "scr", "sys", "jar",
+                                    "war", "ear", "jmod", "class",
+                                ],
                             )
                             .pick_file()
                     {
+                        if is_java_path(&path) {
+                            self.scan_java = true;
+                        }
                         self.source_text = path.to_string_lossy().into_owned();
                     }
                     if ui.button("Folder...").clicked()
@@ -613,9 +643,13 @@ impl OroReseaApp {
                         .on_hover_text(
                             "SetDefaultDllDirectories, SetDllDirectoryW, AddDllDirectory, and LoadLibrary variants.",
                         );
+                    ui.checkbox(&mut self.scan_java, "Java bytecode / JNI")
+                        .on_hover_text(
+                            "Inspect Java class and archive metadata for WDA, mitigation, native-library loading, and JNI bridge indicators. A bytecode reference is not proof a call executes.",
+                        );
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         ui.label(
-                            RichText::new("CAPABILITY SCAN • DOES NOT EXECUTE FILES")
+                            RichText::new("WINDOWS + JAVA CAPABILITY SCAN • DOES NOT EXECUTE FILES")
                                 .size(9.5)
                                 .strong()
                                 .color(MUTED),
@@ -773,11 +807,11 @@ impl OroReseaApp {
 
                 ui.add_space(3.0);
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new("LIVE PROCESS").size(10.0).strong().color(GOLD));
+                    ui.label(RichText::new("LIVE PROCESS / JVM").size(10.0).strong().color(GOLD));
                     ui.add(
                         TextEdit::singleline(&mut self.posture_query)
                             .desired_width(310.0)
-                            .hint_text("Filter by process, PID, or path"),
+                            .hint_text("Filter by process, PID, path, or Java target"),
                     );
                     if ui
                         .checkbox(&mut self.posture_visible_only, "Top-level windows only")
@@ -810,6 +844,13 @@ impl OroReseaApp {
                         ui.spinner();
                     }
                 });
+                ui.label(
+                    RichText::new(
+                        "For a running Java app, select its java.exe, javaw.exe, or custom JVM-host PID. The snapshot measures Windows controls on that process.",
+                    )
+                    .size(10.0)
+                    .color(MUTED),
+                );
             });
 
         if refresh_for_filter_change {
@@ -1237,8 +1278,10 @@ impl OroReseaApp {
                             metadata_pair(ui, "Size", &format_bytes(result.size_bytes));
                             metadata_pair(
                                 ui,
-                                "Signature blob",
-                                if result.embedded_signature {
+                                "PE signature blob",
+                                if is_java_artifact(&result) {
+                                    "Not applicable to Java artifact"
+                                } else if result.embedded_signature {
                                     "Present; trust not validated"
                                 } else {
                                     "Not found"
@@ -1306,6 +1349,7 @@ impl OroReseaApp {
                 methodology_row(ui, RiskLevel::Informational, "GetWindowDisplayAffinity can inspect protection but does not apply it.");
                 methodology_row(ui, RiskLevel::Informational, "Set/GetProcessMitigationPolicy imports show mitigation capability or inspection only. Effective CIG requires live Windows policy readback.");
                 methodology_row(ui, RiskLevel::Informational, "DLL search and LoadLibrary imports are capability evidence. They do not prove a hardening call succeeded or that a load was hostile.");
+                methodology_row(ui, RiskLevel::Informational, "Java class and archive references to native methods, library loading, or protection APIs indicate possible integration points. Reflection, JNI code, runtime dependencies, and actual call paths require separate inspection.");
                 ui.separator();
                 ui.label(
                     RichText::new("Protection posture mode")
@@ -1345,6 +1389,10 @@ impl OroReseaApp {
                 ui.add_space(5.0);
                 ui.label(
                     "Live snapshots query Windows process mitigations, PPL, debugger state, module paths, executable-memory metadata, top-level windows, and WDA. WDAC decisions and historical process-handle access require policy/event telemetry and remain unavailable here.",
+                );
+                ui.add_space(5.0);
+                ui.label(
+                    "For Java applications, select the JVM host PID. WDA and Windows mitigation policies apply to that process and its windows; a JAR does not hold a separate Windows process policy. A Java launch target is best-effort identity evidence, not a complete runtime provenance record.",
                 );
                 ui.separator();
                 ui.label(
@@ -1502,8 +1550,14 @@ fn show_posture_summary(ui: &mut egui::Ui, assessment: &PostureAssessment) {
 }
 
 fn draw_process_row(ui: &mut egui::Ui, process: &ProcessSummary, selected: bool) -> egui::Response {
-    let (rect, response) =
-        ui.allocate_exact_size(Vec2::new(ui.available_width(), 58.0), Sense::click());
+    let java_label = java_process_label(process);
+    let (rect, response) = ui.allocate_exact_size(
+        Vec2::new(
+            ui.available_width(),
+            if java_label.is_some() { 76.0 } else { 58.0 },
+        ),
+        Sense::click(),
+    );
     if selected || response.hovered() {
         ui.painter().rect(
             rect,
@@ -1556,6 +1610,15 @@ fn draw_process_row(ui: &mut egui::Ui, process: &ProcessSummary, selected: bool)
         FontId::proportional(10.0),
         MUTED,
     );
+    if let Some(label) = java_label.as_deref() {
+        painter.text(
+            rect.left_top() + Vec2::new(9.0, 43.0),
+            egui::Align2::LEFT_TOP,
+            label,
+            FontId::proportional(10.0),
+            GOLD,
+        );
+    }
     let path = process
         .executable_path
         .value
@@ -1569,14 +1632,16 @@ fn draw_process_row(ui: &mut egui::Ui, process: &ProcessSummary, selected: bool)
         Color32::from_rgb(167, 179, 191),
     );
 
-    response.on_hover_text(
-        process
-            .executable_path
-            .value
-            .as_deref()
-            .or(process.executable_path.message.as_deref())
-            .unwrap_or("No executable path was returned."),
-    )
+    let path_hint = process
+        .executable_path
+        .value
+        .as_deref()
+        .or(process.executable_path.message.as_deref())
+        .unwrap_or("No executable path was returned.");
+    response.on_hover_text(match java_label {
+        Some(label) => format!("{label}\n{path_hint}"),
+        None => path_hint.to_owned(),
+    })
 }
 
 fn posture_check_box(ui: &mut egui::Ui, check: &PostureCheck) {
@@ -1644,6 +1709,19 @@ fn process_matches(process: &ProcessSummary, query: &str) -> bool {
             .value
             .as_deref()
             .is_some_and(|path| path.to_ascii_lowercase().contains(query))
+        || java_process_label(process)
+            .is_some_and(|label| label.to_ascii_lowercase().contains(query))
+}
+
+fn java_process_label(process: &ProcessSummary) -> Option<String> {
+    let evidence = process.java_app.as_ref()?;
+    let Some(identity) = evidence.value.as_ref() else {
+        return Some("Java runtime • launch identity unavailable".to_owned());
+    };
+    Some(match identity.launch_target.as_deref() {
+        Some(target) => format!("Java {}: {target}", identity.launch_kind.label()),
+        None => "Java runtime • launch target unavailable".to_owned(),
+    })
 }
 
 fn posture_target_label(assessment: &PostureAssessment) -> String {
@@ -1828,6 +1906,21 @@ fn posture_methodology_row(ui: &mut egui::Ui, verdict: PostureVerdict, detail: &
         );
         ui.label(detail);
     });
+}
+
+fn is_java_artifact(result: &ScanResult) -> bool {
+    result.file_kind.starts_with("Java ")
+}
+
+fn is_java_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            matches!(
+                extension.to_ascii_lowercase().as_str(),
+                "jar" | "war" | "ear" | "jmod" | "class"
+            )
+        })
 }
 
 fn result_matches(result: &ScanResult, query: &str) -> bool {

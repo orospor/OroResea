@@ -1,6 +1,6 @@
 [package]
 name = "ororesea"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 description = "Read-only Windows capture-protection capability and process-posture analyzer"
 
@@ -13,6 +13,7 @@ serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
 sha2 = "0.10.9"
 walkdir = "2.5.0"
+zip = { version = "2.4.2", default-features = false, features = ["deflate"] }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61.2", features = [

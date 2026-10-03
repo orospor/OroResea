@@ -51,6 +51,8 @@ pub enum EvidenceKind {
     MitigationApi,
     DllSearchHardening,
     LoaderCapability,
+    JavaBytecode,
+    JavaNativeBridge,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -132,6 +134,7 @@ pub enum ProtectionKind {
     ExecutableMemory,
     Wdac,
     HandleAccessMonitoring,
+    JvmApplicationIdentity,
 }
 
 impl ProtectionKind {
@@ -158,6 +161,7 @@ impl ProtectionKind {
             Self::ExecutableMemory => "Executable memory",
             Self::Wdac => "WDAC",
             Self::HandleAccessMonitoring => "Handle-access telemetry",
+            Self::JvmApplicationIdentity => "JVM application identity",
         }
     }
 }
